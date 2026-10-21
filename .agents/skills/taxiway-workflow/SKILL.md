@@ -36,12 +36,35 @@ included, and none sees another's worktrees or processes: the state of work is
 on GitHub (issues, branches, PRs, checks), and that of scheduled agents in the
 [state repository](../taxiway-agents/SKILL.md#state-repository).
 [Selection](../taxiway-issue/SKILL.md#1-selection) says how a session checks
-and shows that a subject is taken. The coordinator session is the maintainer's
-entry point for status, decisions and priorities: it delegates work to
-subagents or dedicated sessions and reads that state rather than relying on
-memory. A decision recorded nowhere there, in the repository or in the
-current conversation is asked of the maintainer, then recorded as
+and shows that a subject is taken. The [coordinator](#coordinator) session is
+the maintainer's entry point for status, decisions and priorities: it
+delegates work to subagents or dedicated sessions and reads that state rather
+than relying on memory. A decision recorded nowhere there, in the repository
+or in the current conversation is asked of the maintainer, then recorded as
 [Decisions](#decisions) says.
+
+## Coordinator
+
+[`/taxiway-coordinator`](../taxiway-coordinator/SKILL.md) runs this section in
+a new session on `taxiway`; it needs nothing from earlier sessions.
+
+1. Read [`taxiway-agents`](../taxiway-agents/SKILL.md) after this skill.
+2. Attach `taxiway-sh/agents` with push (`add_repo`, `access: push`) and clone
+   it next to `taxiway` on `main`; the maintainer approves the attachment in
+   this session. When it does not exist,
+   [Bootstrapping](../taxiway-agents/SKILL.md#bootstrapping) applies and the
+   coordinator stops there.
+3. Reconcile as [Intake and reconciliation](#intake-and-reconciliation) says,
+   without its opening question, then run the
+   [Check](../taxiway-agents/SKILL.md#check) of scheduled agents.
+4. When the Check finds something [Install](../taxiway-agents/SKILL.md#install)
+   repairs, present Install's [Plan](../taxiway-agents/SKILL.md#plan) in its
+   default mode; the maintainer's OK on it is the approval. A machine agent with no heartbeat
+   yet waits for a maintainer's [Machine setup](../taxiway-agents/SKILL.md#machine-setup);
+   an [offline](../taxiway-agents/SKILL.md#heartbeat-offline-machine-and-metrics)
+   one waits for a maintainer to bring it back.
+5. Report briefly what is in service, what waits for the maintainer and what
+   is abnormal, then ask the opening question.
 
 ## Approvals
 
