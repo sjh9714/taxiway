@@ -18,11 +18,12 @@ and cloud-session limits follow the
   credentials.
 - Run with the worktree's dev/e2e environment loaded. Use bounded commands and
   short prompts. Real model calls consume account usage and are opt-in.
-- Name persistent manual-validation labs `test-claude`, `test-codex` and
-  `test-gastown` within the active worktree context. Reuse existing labs under
-  their actual names; do not rename, recreate or replace them merely to adopt
-  this convention. Keep persistent labs available for the user's manual checks
-  and remove them only when requested. Temporary scenario names remain unique.
+- Name persistent manual-validation labs `test-claude`, `test-codex`,
+  `test-gastown` and `test-gascity` within the active worktree context. Reuse
+  existing labs under their actual names; do not rename, recreate or replace
+  them merely to adopt this convention. Keep persistent labs available for the
+  user's manual checks and remove them only when requested. Temporary scenario
+  names remain unique.
 - Reuse the user's authenticated reference lab. Request interactive login only
   when the required login is missing or unusable; do not request it for every lab.
 - Copy only Claude OAuth credentials through `propagate_claude_auth`; never
