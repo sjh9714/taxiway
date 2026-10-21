@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/taxiway-sh/taxiway/internal/config"
 	"github.com/taxiway-sh/taxiway/internal/driver"
+	"github.com/taxiway-sh/taxiway/internal/modelcatalog"
 )
 
 // observabilityDir returns the absolute path to the bundled observability assets under
@@ -40,7 +42,7 @@ func observabilityComposeFiles(state *RootState) []string {
 
 func observabilityComposeServices() []string {
 	return []string{
-		"minio",
+		"seaweedfs",
 		"postgres",
 		"redis",
 		"clickhouse",
@@ -92,15 +94,7 @@ type observabilityRuntime struct {
 }
 
 type observabilityRuntimeState struct {
-	Initialized          bool `json:"initialized,omitempty"`
-	WorkerPort           int  `json:"worker_port,omitempty"`
-	LangfusePort         int  `json:"langfuse_port,omitempty"`
-	ClickHouseHTTPPort   int  `json:"clickhouse_http_port,omitempty"`
-	ClickHouseNativePort int  `json:"clickhouse_native_port,omitempty"`
-	MinIOPort            int  `json:"minio_port,omitempty"`
-	MinIOConsolePort     int  `json:"minio_console_port,omitempty"`
-	RedisPort            int  `json:"redis_port,omitempty"`
-	PostgresPort         int  `json:"postgres_port,omitempty"`
+	Initialized bool `json:"initialized,omitempty"`
 }
 
 func (state *RootState) resolveObservabilityRuntime() (observabilityRuntime, error) {
@@ -165,15 +159,6 @@ func readDevObservabilityRuntimeState(stateDir string) (observabilityRuntimeStat
 		return state, false, fmt.Errorf("read observability runtime state: %w", err)
 	}
 	return state, true, nil
-}
-
-func applyObservabilityRuntimeState(runtime *observabilityRuntime, state observabilityRuntimeState) {
-	_ = runtime
-	_ = state
-}
-
-func applyDefaultObservabilityRuntimePorts(runtime *observabilityRuntime) {
-	_ = runtime
 }
 
 func ensureDevObservabilityRuntimeState(runtime *observabilityRuntime) error {
@@ -251,8 +236,6 @@ func (state *RootState) ensureObservabilityRuntime() (observabilityRuntime, erro
 		if err := ensureDevObservabilityRuntimeState(&runtime); err != nil {
 			return observabilityRuntime{}, err
 		}
-	} else {
-		applyDefaultObservabilityRuntimePorts(&runtime)
 	}
 	state.Observability = runtime
 	return runtime, nil
@@ -287,18 +270,15 @@ func (runtime observabilityRuntime) ComposeEnv(proxy proxyRuntime) []string {
 	return env
 }
 
-type liteLLMModelCatalog struct {
-	Models []liteLLMModelDefinition `yaml:"models"`
+// modelNow is shared by catalog selection and display; tests can freeze lifecycle time.
+var modelNow = time.Now
+
+func liteLLMChatGPTPricingAssetPath(state *RootState) string {
+	return filepath.Join(state.RepoDir, "infra", "gateway", "litellm", "callbacks", "chatgpt_pricing.py")
 }
 
-type liteLLMModelDefinition struct {
-	Name                 string `yaml:"name"`
-	Provider             string `yaml:"provider"`
-	Upstream             string `yaml:"upstream"`
-	APIBase              string `yaml:"api_base,omitempty"`
-	APIKey               string `yaml:"api_key,omitempty"`
-	API                  string `yaml:"api,omitempty"`
-	ForwardClientHeaders bool   `yaml:"forward_client_headers,omitempty"`
+func liteLLMAnthropicProtocolAssetPath(state *RootState) string {
+	return filepath.Join(state.RepoDir, "infra", "gateway", "litellm", "callbacks", "anthropic_protocol.py")
 }
 
 type liteLLMGeneratedConfig struct {
@@ -376,6 +356,8 @@ func renderLiteLLMConfig(state *RootState, includeCodexModels bool, enableCodexS
 
 	var models []liteLLMGeneratedModelEntry
 	var forwardHeaders []string
+	hasAnthropic := false
+	hasChatGPT := false
 	selected := map[string]bool{}
 	for _, name := range selectedModels {
 		if name != "" {
@@ -399,7 +381,12 @@ func renderLiteLLMConfig(state *RootState, includeCodexModels bool, enableCodexS
 			continue
 		}
 		if selected[model.Name] {
+			if err := model.SelectionError(modelNow()); err != nil {
+				return nil, err
+			}
 			matchedSelected[model.Name] = true
+		} else if model.StatusAt(modelNow()) != "active" {
+			continue
 		}
 		if model.Provider == "chatgpt" && !includeCodexModels && len(selected) == 0 {
 			continue
@@ -416,6 +403,8 @@ func renderLiteLLMConfig(state *RootState, includeCodexModels bool, enableCodexS
 			entry.ModelInfo = &liteLLMGeneratedModelInfo{Mode: model.API}
 		}
 		models = append(models, entry)
+		hasAnthropic = hasAnthropic || model.Provider == "anthropic"
+		hasChatGPT = hasChatGPT || model.Provider == "chatgpt"
 		if model.ForwardClientHeaders {
 			addForwardHeader(model.Name)
 		}
@@ -427,6 +416,12 @@ func renderLiteLLMConfig(state *RootState, includeCodexModels bool, enableCodexS
 	}
 
 	callbacks := []string{"langfuse_otel"}
+	if hasAnthropic {
+		callbacks = append(callbacks, "anthropic_protocol.proxy_handler_instance")
+	}
+	if hasChatGPT {
+		callbacks = append(callbacks, "chatgpt_pricing.proxy_handler_instance")
+	}
 	if enableCodexSessionMapper {
 		callbacks = append([]string{"codex_session_mapper.proxy_handler_instance"}, callbacks...)
 	}
@@ -457,12 +452,8 @@ func renderLiteLLMConfig(state *RootState, includeCodexModels bool, enableCodexS
 	return out, nil
 }
 
-func parseLiteLLMModelCatalog(data []byte) (liteLLMModelCatalog, error) {
-	var catalog liteLLMModelCatalog
-	if err := yaml.Unmarshal(data, &catalog); err != nil {
-		return liteLLMModelCatalog{}, fmt.Errorf("parsing LiteLLM model catalog: %w", err)
-	}
-	return catalog, nil
+func parseLiteLLMModelCatalog(data []byte) (modelcatalog.Catalog, error) {
+	return modelcatalog.Parse(data)
 }
 
 func ensureLiteLLMChatGPTAuth(stateDir string, required bool) (bool, error) {
@@ -486,8 +477,30 @@ func ensureLiteLLMChatGPTAuth(stateDir string, required bool) (bool, error) {
 	}
 
 	dst := liteLLMChatGPTAuthStatePath(stateDir)
+	// MkdirAll and WriteFile only apply modes on creation, so restrict an
+	// existing directory and file too.
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return false, fmt.Errorf("creating LiteLLM ChatGPT auth directory: %w", err)
+	}
+	if err := os.Chmod(filepath.Dir(dst), 0o700); err != nil {
+		return false, fmt.Errorf("restricting LiteLLM ChatGPT auth directory: %w", err)
+	}
 	if dstInfo, statErr := os.Stat(dst); statErr == nil && !sourceInfo.ModTime().After(dstInfo.ModTime()) {
-		return true, nil
+		// LiteLLM can replace an invalid cache with device-login state. Its
+		// modification time alone does not mean usable credentials exist.
+		cached, readErr := os.ReadFile(dst)
+		var tokens struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			IDToken      string `json:"id_token"`
+		}
+		if readErr == nil && json.Unmarshal(cached, &tokens) == nil &&
+			tokens.AccessToken != "" && tokens.RefreshToken != "" && tokens.IDToken != "" {
+			if err := restrictLiteLLMChatGPTAuthFile(dst); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
 	}
 
 	data, err := os.ReadFile(sourcePath)
@@ -498,13 +511,22 @@ func ensureLiteLLMChatGPTAuth(stateDir string, required bool) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return false, fmt.Errorf("creating LiteLLM ChatGPT auth directory: %w", err)
-	}
 	if err := os.WriteFile(dst, converted, 0o600); err != nil {
 		return false, fmt.Errorf("writing LiteLLM ChatGPT auth file: %w", err)
 	}
+	if err := restrictLiteLLMChatGPTAuthFile(dst); err != nil {
+		return false, err
+	}
 	return true, nil
+}
+
+// restrictLiteLLMChatGPTAuthFile tightens an existing cache file. A
+// container-owned file cannot be changed; its directory still restricts it.
+func restrictLiteLLMChatGPTAuthFile(path string) error {
+	if err := os.Chmod(path, 0o600); err != nil && !errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("restricting LiteLLM ChatGPT auth file: %w", err)
+	}
+	return nil
 }
 
 func convertCodexAuthToLiteLLMChatGPTAuth(data []byte) ([]byte, error) {
@@ -698,7 +720,7 @@ func ensureEnvFile(envPath string) (created bool, err error) {
 			func() (string, error) { return generateSecret(24) },
 		},
 		{
-			"LANGFUSE_MINIO_ROOT_PASSWORD",
+			"LANGFUSE_S3_SECRET_ACCESS_KEY",
 			func() (string, error) { return generateSecret(24) },
 		},
 		{
@@ -1275,6 +1297,9 @@ func destroyTaxiwayRuntime(w io.Writer, state *RootState) error {
 	fmt.Fprintln(w, "Labs: removed")
 
 	if _, err := removeProxyContainer(state); err != nil {
+		return err
+	}
+	if err := removeProxyDockerNetwork(proxy); err != nil {
 		return err
 	}
 	if err := os.RemoveAll(proxy.StateDir); err != nil {

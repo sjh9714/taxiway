@@ -15,7 +15,11 @@ the binary to `$HOME/.local/bin` by default.
 
 ## Cut a Release
 
-1. Ensure `main` is green and ready.
+1. Qualify the exact clean candidate with the
+   [release recipe](release-qualification.md) and shared `taxiway-release` skill.
+   Present its evidence, blockers and untested combinations. Core CI alone is
+   insufficient. Qualification-only invocation does not authorize publication;
+   get explicit authorization before creating/pushing a tag or publishing.
 2. Create and push a semver tag:
 
    ```bash
@@ -41,9 +45,7 @@ For a manual release workflow run, select a version tag, or a commit carrying
 one. The workflow resolves that tag before publication and passes it explicitly
 to installation qualification.
 
-GoReleaser builds release notes from Conventional Commit-style messages. Use
-`feat:` for user-facing capabilities, `fix:` for bug fixes, and cleanup-style
-messages such as `cleanup:` for simplification or removal work. See
+GoReleaser builds release notes from commit subjects; follow
 [Development](development.md#commit-messages).
 
 ## Supported Platforms

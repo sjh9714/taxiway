@@ -42,6 +42,7 @@ started inside a lab.
 | `claude-code` | Anthropic Claude Code CLI | Claude Code | [Claude Code](orchestrators/claude-code.md) |
 | `codex` | OpenAI Codex CLI | Codex | [Codex](orchestrators/codex.md) |
 | `gastown` | Gas Town HQ and workspace shell | Claude Code | [Gas Town](orchestrators/gastown.md) |
+| `gascity` | Gas City city, rig and workspace shell | Claude Code | [Gas City](orchestrators/gascity.md) |
 
 Inspect what an adapter provides for a given type:
 
@@ -67,6 +68,11 @@ Typical flow:
 
 - [Development](contributing/development.md)
 - [Testing](contributing/testing.md)
+- [Agent-driven live validation](contributing/live-tests.md)
+- [Model gateway validation](contributing/model-gateway-tests.md)
+- [Model catalog updates](contributing/model-catalog.md)
 - [Issues](contributing/issues.md)
+- [Project agents](contributing/agentic-system.md)
 - [Release](contributing/release.md)
+- [Release qualification recipe](contributing/release-qualification.md)
 - [Installation qualification](contributing/installation-qualification.md)

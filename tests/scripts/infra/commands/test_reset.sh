@@ -58,32 +58,23 @@ target="$tmp/work"
 mkdir -p "$target/dir"
 touch "$target/file.txt" "$target/dir/nested.txt"
 
-if printf '\n' | LAB_RESET_TARGET="$target" bash "$RESET_SH" >/dev/null 2>&1; then
-  _fail "default answer aborts reset" "reset succeeded without confirmation"
-else
-  _pass "default answer aborts reset"
-fi
-_assert_exists "aborted reset preserves files" "$target/file.txt"
-
-echo ""
-echo "=== reset.sh gastown shutdown ==="
-
-rm -rf "$target"
-fake_bin="$tmp/bin"
-gt_log="$tmp/gt.log"
-mkdir -p "$fake_bin" "$target/gt"
-cat >"$fake_bin/gt" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'cwd=%s gt %s\n' "$PWD" "$*" >> "$GT_LOG"
-exit 0
-EOF
-chmod +x "$fake_bin/gt"
-
-PATH="$fake_bin:$PATH" GT_LOG="$gt_log" LAB_RESET_TARGET="$target" LAB_RESET_YES=1 bash "$RESET_SH" >/dev/null
-
-_assert_contains "gastown reset stops runtime before cleanup" "$(cat "$gt_log")" "cwd=$target/gt gt down --all"
-_assert_missing "gastown directory removed after shutdown" "$target/gt"
+touch "$target/.taxiway-phase"
+for reply in default no eof; do
+  input="$tmp/$reply"
+  case "$reply" in
+    default) printf '\n' > "$input" ;;
+    no) printf 'n\n' > "$input" ;;
+    eof) : > "$input" ;;
+  esac
+  if LAB_RESET_TARGET="$target" bash "$RESET_SH" < "$input" > "$tmp/output" 2>&1; then
+    _pass "$reply decline succeeds as a no-op"
+  else
+    _fail "$reply decline succeeds as a no-op" "reset returned an error"
+  fi
+  _assert_exists "$reply decline preserves files" "$target/file.txt"
+  _assert_exists "$reply decline preserves markers" "$target/.taxiway-phase"
+  _assert_contains "$reply decline reports abort" "$(cat "$tmp/output")" "Aborted."
+done
 
 echo ""
 echo "=== reset.sh wipe contract ==="

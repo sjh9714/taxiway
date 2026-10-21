@@ -1,0 +1,14 @@
+{
+  "id": "watchdog",
+  "title": "Taxiway – agents watchdog",
+  "schedule": "45 4 * * *",
+  "model": "default",
+  "repositories": {
+    "taxiway-sh/taxiway": "read",
+    "taxiway-sh/agents": "write"
+  },
+  "workdir": "taxiway",
+  "skills": ["taxiway-agents"],
+  "outputs": ["report", "status/watchdog.json"],
+  "autonomy": {}
+}

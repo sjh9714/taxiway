@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -22,14 +24,16 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/taxiway-sh/taxiway/internal/config"
 	"github.com/taxiway-sh/taxiway/internal/driver"
+	"github.com/taxiway-sh/taxiway/internal/modelcatalog"
 	"github.com/taxiway-sh/taxiway/internal/phases"
 	"github.com/taxiway-sh/taxiway/internal/recording"
 )
 
-const e2eFixtureRepoURL = "https://github.com/manufacture-dev/agreement-hub.git"
+const e2eFixtureRepoURL = "https://github.com/taxiway-sh/e2e-fixture.git"
 const e2eFakeModelResponse = "taxiway e2e fake upstream"
 
 // Orchestrators own workspace layout and session behavior. Agent assertions are
@@ -42,6 +46,19 @@ type e2eOrchestratorExpectations struct {
 	workspaceTrustedBeforeStart bool
 	assertSessions              func(*testing.T, *RootState, string)
 	checkHandoff                func(*testing.T, *RootState, string)
+	// readinessActions replaces the single-session readiness probe for
+	// orchestrators that run several native agent sessions.
+	readinessActions func(*testing.T, *RootState, string, string)
+	// upSettings are explicit, non-default selections proven by the up scenario.
+	upSettings []string
+	// settingsFile means Claude reads its bypass-warning setting from a
+	// --settings file written by the orchestrator instead of inline JSON.
+	settingsFile bool
+	// resetStopLabel is the step the adapter's stop.sh hook plans before reset
+	// clears the workspace; empty when the adapter has no stop hook.
+	resetStopLabel string
+	// assertServicesStopped observes that reset stopped the adapter's services.
+	assertServicesStopped func(*testing.T, *RootState, string)
 }
 
 type e2eFixtureWorkspace struct {
@@ -55,23 +72,36 @@ func e2eExpectations(t *testing.T, orch string) e2eOrchestratorExpectations {
 	switch orch {
 	case "claude-code":
 		return e2eOrchestratorExpectations{
-			model: "claude-opus-4-8", recordInput: "/status",
+			model: e2ePrincipalModel(t, orch), recordInput: "/status",
 			workspaceAssertion: "assert:workspace-cloned", workspace: e2ePlainFixtureWorkspace,
 			workspaceTrustedBeforeStart: true,
+			assertSessions:              assertE2EClaudeCodeSession,
 		}
 	case "codex":
 		return e2eOrchestratorExpectations{
-			model: "gpt-5.5", recordInput: "/status",
+			model: e2ePrincipalModel(t, orch), recordInput: "/status",
 			workspaceAssertion: "assert:workspace-cloned", workspace: e2ePlainFixtureWorkspace,
 			workspaceTrustedBeforeStart: true,
 		}
 	case "gastown":
 		return e2eOrchestratorExpectations{
-			model: "claude-opus-4-8", recordInput: "gt status",
+			model: e2ePrincipalModel(t, orch), recordInput: "gt status",
 			workspaceAssertion: "assert:workspace-provisioned", workspace: e2eGastownFixtureWorkspace,
 			// Gastown approves each working directory when its agent launches.
 			workspaceTrustedBeforeStart: false, assertSessions: assertE2EGastownSessions,
-			checkHandoff: assertE2EGastownHandoff,
+			checkHandoff: runE2EGastownHandoff, readinessActions: runE2EGastownReadinessActions,
+			resetStopLabel: "Stopping Gas Town services when present",
+		}
+	case "gascity":
+		return e2eOrchestratorExpectations{
+			model: e2ePrincipalModel(t, orch), recordInput: "gc status",
+			workspaceAssertion: "assert:workspace-provisioned", workspace: e2eGascityFixtureWorkspace,
+			// The workspace clone is trusted before start; start trusts the city.
+			workspaceTrustedBeforeStart: true, assertSessions: assertE2EGascitySessions,
+			checkHandoff: runE2EGascityHandoff, readinessActions: runE2EGascityReadinessActions,
+			upSettings: []string{"effort=high"}, settingsFile: true,
+			resetStopLabel:        "Stopping the Gas City city, supervisor and nudge pollers when present",
+			assertServicesStopped: assertE2EGascityStopped,
 		}
 	default:
 		t.Fatalf("unsupported E2E orchestrator %q", orch)
@@ -91,6 +121,10 @@ func TestE2E_OrchestratorGastown_Up(t *testing.T) {
 	testE2EOrchestratorUp(t, "gastown")
 }
 
+func TestE2E_OrchestratorGascity_Up(t *testing.T) {
+	testE2EOrchestratorUp(t, "gascity")
+}
+
 func TestE2E_OrchestratorCodex_PrepareRun(t *testing.T) {
 	testE2EOrchestratorPrepareRun(t, "codex")
 }
@@ -101,6 +135,10 @@ func TestE2E_OrchestratorClaudeCode_PrepareRun(t *testing.T) {
 
 func TestE2E_OrchestratorGastown_PrepareRun(t *testing.T) {
 	testE2EOrchestratorPrepareRun(t, "gastown")
+}
+
+func TestE2E_OrchestratorGascity_PrepareRun(t *testing.T) {
+	testE2EOrchestratorPrepareRun(t, "gascity")
 }
 
 func TestE2E_OrchestratorCodex_PhaseByPhase(t *testing.T) {
@@ -115,6 +153,10 @@ func TestE2E_OrchestratorGastown_PhaseByPhase(t *testing.T) {
 	testE2EOrchestratorPhaseByPhase(t, "gastown")
 }
 
+func TestE2E_OrchestratorGascity_PhaseByPhase(t *testing.T) {
+	testE2EOrchestratorPhaseByPhase(t, "gascity")
+}
+
 func testE2EOrchestratorPrepareRun(t *testing.T, orch string) {
 	t.Helper()
 	expectations := e2eExpectations(t, orch)
@@ -124,11 +166,12 @@ func testE2EOrchestratorPrepareRun(t *testing.T, orch string) {
 	configureE2EScenarioEnvironment(t, scope)
 	id := uniqueDockerID(t, orch, "prepare-run")
 	lab := labNameFromID(id)
-	fakeUpstream := startE2EFakeOpenAIUpstream(t)
+	fakeUpstream := startE2EFakeModelUpstream(t)
 	root, state, tb := buildRealOrchestratorDockerRoot(t, orch, scope)
 	cleanupE2EOrchestratorLab(t, state, id, lab, orch)
-	configureE2ELiteLLMModelCatalog(t, state, fakeUpstream)
+	configureE2ELiteLLMModelCatalog(t, state, fakeUpstream.baseURL)
 	stateDir := config.StateDir(state.Flags.StateDir, state.RepoDir)
+	runE2EInvalidModelSelections(t, root, tb, state, id, lab, orch)
 
 	runE2EStep(t, "taxiway:init", func(t *testing.T) {
 		ensureE2ERuntimeInitialized(t, root, tb)
@@ -138,7 +181,7 @@ func testE2EOrchestratorPrepareRun(t *testing.T, orch string) {
 	})
 
 	runE2EStep(t, fmt.Sprintf("taxiway:prepare[--type=%s]", orch), func(t *testing.T) {
-		runE2ECommand(t, root, tb, "prepare", lab, "--type", orch)
+		runE2ECommand(t, root, tb, "prepare", lab, "--type", orch, "--set", "auth_mode=api-key", "--set", e2eHarnessPin(orch))
 		configureE2EFixtureWorkspace(t, state, id)
 		runE2EAssert(t, "assert:phase-verified", func(t *testing.T) {
 			assertE2EPhase(t, stateDir, id, phases.PhaseVerify)
@@ -147,6 +190,12 @@ func testE2EOrchestratorPrepareRun(t *testing.T, orch string) {
 			assertE2EList(t, root, tb, lab, orch, "degraded", "verified")
 		})
 	})
+
+	if orch != "codex" {
+		runE2EStep(t, "fixture:complete-native-onboarding", func(t *testing.T) {
+			configureE2ECompletedClaudeOnboarding(t, state, id, orch)
+		})
+	}
 
 	runE2EStep(t, "taxiway:run[--skip-auth-check]", func(t *testing.T) {
 		runE2ECommand(t, root, tb, "run", lab, "--skip-auth-check")
@@ -165,18 +214,38 @@ func testE2EOrchestratorPrepareRun(t *testing.T, orch string) {
 		runE2EAssert(t, "assert:gateway-started", func(t *testing.T) {
 			assertE2EGatewayRuntimeRunning(t, state, lab, orch)
 		})
+		runE2EAssert(t, "assert:gateway-models-priced", func(t *testing.T) {
+			assertE2EGatewayModelsPriced(t, state, lab, orch)
+		})
 		runE2EAssert(t, "assert:gateway-routed", func(t *testing.T) {
 			assertE2EGatewayRequestRouted(t, state, lab, orch, fakeUpstream)
+		})
+		runE2EAssert(t, "assert:gateway-protocol-preserved", func(t *testing.T) {
+			assertE2EGatewayProtocol(t, state, lab, orch, fakeUpstream)
 		})
 		runE2EAssert(t, "assert:trace-ingested", func(t *testing.T) {
 			assertE2EObservabilityTraceIngested(t, state, lab, orch)
 		})
+		runE2EAssert(t, "assert:generation-cost-provided", func(t *testing.T) {
+			assertE2EGenerationCostProvided(t, state, lab, orch)
+		})
+		runE2EAssert(t, "assert:shell-target-ready", func(t *testing.T) {
+			assertE2EShellCheck(t, root, tb, lab, orch)
+		})
+		assertE2EStartedAgents(t, state, id, orch)
+
 	})
 
-	runE2EStep(t, e2eCommandStepAt("after-start", "shell", "--check"), func(t *testing.T) {
-		assertE2EShellCheck(t, root, tb, lab, orch)
-	})
-	assertE2EStartedAgents(t, state, id, orch, "after-start")
+	if expectations.readinessActions != nil {
+		expectations.readinessActions(t, state, id, "after-start")
+	} else {
+		runE2EStep(t, "agent:send[controlled-readiness-probe]", func(t *testing.T) {
+			observation := runE2EInteractiveProbe(t, state, id, "", orch)
+			runE2EAssert(t, "assert:interactive-response-completed", func(t *testing.T) {
+				assertE2EInteractiveObservation(t, observation, false)
+			})
+		})
+	}
 
 	runE2EStep(t, e2eCommandStepAt("after-start", "doctor"), func(t *testing.T) {
 		runE2ECommand(t, root, tb, "doctor", lab)
@@ -199,6 +268,46 @@ func testE2EOrchestratorPrepareRun(t *testing.T, orch string) {
 	})
 }
 
+type e2eDryRunLabels struct {
+	Bootstrap []string
+	Install   []string
+	Verify    []string
+	Workspace []string
+	Auth      []string
+	Start     []string
+}
+
+func e2eSemanticDryRunLabels(orch string) e2eDryRunLabels {
+	labels := e2eDryRunLabels{Bootstrap: []string{"Guest environment: container", "Updating apt cache", "Enabling Corepack"}}
+	switch orch {
+	case "codex":
+		labels.Install = []string{"Installing @openai/codex@"}
+		labels.Verify = []string{"Verifying codex version and help"}
+		labels.Workspace = []string{"Cloning workspace repository"}
+		labels.Auth = []string{"Authentication is managed by the Taxiway LiteLLM gateway"}
+		labels.Start = []string{"Starting tmux session 'codex'"}
+	case "claude-code":
+		labels.Install = []string{"Installing @anthropic-ai/claude-code@"}
+		labels.Verify = []string{"Verifying claude version, help, and auth status"}
+		labels.Workspace = []string{"Cloning workspace repository"}
+		labels.Auth = []string{"Checking Claude Code authentication"}
+		labels.Start = []string{"Starting tmux session 'claude-code'"}
+	case "gastown":
+		labels.Install = []string{"Installing Gas Town", "Installing @anthropic-ai/claude-code@"}
+		labels.Verify = []string{"Verifying tool versions", "Verifying claude version, help, and auth status"}
+		labels.Workspace = []string{"Adding rig", "Adding crew workspace"}
+		labels.Auth = []string{"Checking Claude Code authentication"}
+		labels.Start = []string{"Checking Gas Town runtime health", "Starting crew workspace", "Starting tmux session 'gastown'"}
+	case "gascity":
+		labels.Install = []string{"Installing Gas City", "Installing @anthropic-ai/claude-code@"}
+		labels.Verify = []string{"Verifying tool versions", "Verifying claude version, help, and auth status"}
+		labels.Workspace = []string{"Cloning workspace repository", "Adding rig 'e2e-fixture'"}
+		labels.Auth = []string{"Checking Claude Code authentication"}
+		labels.Start = []string{"Configuring Gas City for the Taxiway LiteLLM gateway", "Waiting for Gas City agent sessions", "Starting tmux session 'gascity'"}
+	}
+	return labels
+}
+
 func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 	t.Helper()
 	expectations := e2eExpectations(t, orch)
@@ -208,16 +317,35 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 	configureE2EScenarioEnvironment(t, scope)
 	id := uniqueDockerID(t, orch, "phase-by-phase")
 	lab := labNameFromID(id)
-	fakeUpstream := startE2EFakeOpenAIUpstream(t)
+	fakeUpstream := startE2EFakeModelUpstream(t)
 	root, state, tb := buildRealOrchestratorDockerRoot(t, orch, scope)
 	cleanupE2EOrchestratorLab(t, state, id, lab, orch)
-	configureE2ELiteLLMModelCatalog(t, state, fakeUpstream)
+	configureE2ELiteLLMModelCatalog(t, state, fakeUpstream.baseURL)
 	stateDir := config.StateDir(state.Flags.StateDir, state.RepoDir)
+	runE2EInvalidModelSelections(t, root, tb, state, id, lab, orch)
+	dryRunLabels := e2eSemanticDryRunLabels(orch)
 
 	runE2EStep(t, "taxiway:init", func(t *testing.T) {
 		ensureE2ERuntimeInitialized(t, root, tb)
 		runE2EAssert(t, "assert:runtime-initialized", func(t *testing.T) {
 			assertE2EObservabilityRunning(t, state)
+		})
+	})
+
+	runE2EStep(t, fmt.Sprintf("taxiway:create[--type=%s,--dry-run]", orch), func(t *testing.T) {
+		existedBefore, err := state.Driver.Exists(context.Background(), id)
+		require.NoError(t, err)
+		phaseStateBefore := captureE2EPhaseState(stateDir, id)
+		output := runE2EDryRunCommand(t, root, tb, state, false, "create", lab, "--type", orch)
+		require.Contains(t, output, "Creating Docker lab runtime")
+		require.Contains(t, output, "No changes were made.")
+		runE2EAssert(t, "assert:phase-markers-preserved", func(t *testing.T) {
+			require.Equal(t, phaseStateBefore, captureE2EPhaseState(stateDir, id))
+		})
+		runE2EAssert(t, "assert:lab-runtime-preserved", func(t *testing.T) {
+			existsAfter, err := state.Driver.Exists(context.Background(), id)
+			require.NoError(t, err)
+			require.Equal(t, existedBefore, existsAfter)
 		})
 	})
 
@@ -230,8 +358,39 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 		runE2EAssert(t, "assert:lab-listed", func(t *testing.T) {
 			assertE2EList(t, root, tb, lab, orch, "degraded", "created")
 		})
+		runE2EAssert(t, "assert:container-guest-contract", func(t *testing.T) {
+			assertE2EContainerGuest(t, state, id)
+		})
+		runE2EAssert(t, "assert:driver-inspection-errors-preserved", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, err := state.Driver.Exists(ctx, id)
+			require.ErrorIs(t, err, context.Canceled, "inspection failure must not mean absent")
+			st, err := state.Driver.Status(ctx, id)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Empty(t, st.State)
+		})
 	})
 
+	runE2EStep(t, "docker:pause[owned-lab-inspection-fixture]", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "docker", "pause", id).CombinedOutput()
+		require.NoError(t, err, "pause owned lab: %s", out)
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, "docker", "unpause", id).CombinedOutput()
+			require.NoError(t, err, "resume owned lab: %s", out)
+		})
+		runE2EAssert(t, "assert:paused-lab-reported-stopped", func(t *testing.T) {
+			st, err := state.Driver.Status(context.Background(), id)
+			require.NoError(t, err)
+			require.Equal(t, "stopped", st.State, "paused lab must stay within the status contract")
+		})
+	})
+
+	runE2EScriptDryRunStep(t, "taxiway:bootstrap[--dry-run]", root, tb, state, stateDir, id, false, dryRunLabels.Bootstrap, "bootstrap", lab)
 	runE2EStep(t, "taxiway:bootstrap", func(t *testing.T) {
 		runE2ECommand(t, root, tb, "bootstrap", lab)
 		runE2EAssert(t, "assert:phase-bootstrapped", func(t *testing.T) {
@@ -239,8 +398,9 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 		})
 	})
 
+	runE2EScriptDryRunStep(t, "taxiway:install[--dry-run]", root, tb, state, stateDir, id, false, dryRunLabels.Install, "install", lab)
 	runE2EStep(t, "taxiway:install", func(t *testing.T) {
-		runE2ECommand(t, root, tb, "install", lab)
+		runE2ECommand(t, root, tb, "install", lab, "--set", "model="+expectations.model, "--set", e2eHarnessPin(orch))
 		runE2EAssert(t, "assert:phase-installed", func(t *testing.T) {
 			assertE2EPhase(t, stateDir, id, phases.PhaseInstall)
 		})
@@ -249,10 +409,27 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 		})
 	})
 
+	runE2EScriptDryRunStep(t, "taxiway:verify[--dry-run]", root, tb, state, stateDir, id, false, dryRunLabels.Verify, "verify", lab)
 	runE2EStep(t, "taxiway:verify", func(t *testing.T) {
 		runE2ECommand(t, root, tb, "verify", lab)
 		runE2EAssert(t, "assert:phase-verified", func(t *testing.T) {
 			assertE2EPhase(t, stateDir, id, phases.PhaseVerify)
+		})
+	})
+
+	runE2EStep(t, "taxiway:gateway[--dry-run]", func(t *testing.T) {
+		phaseStateBefore := captureE2EPhaseState(stateDir, id)
+		ref := config.LabRef{Lab: lab, Orch: orch, Driver: state.Driver.Name()}
+		sidecar := e2eLabLiteLLMContainer(state, ref)
+		sidecarStateBefore := e2eDockerContainerState(t, sidecar)
+		output := runE2EDryRunCommand(t, root, tb, state, false, "gateway", lab)
+		require.Contains(t, output, "Configuring lab gateway environment")
+		require.Contains(t, output, "Reconciling LiteLLM sidecar")
+		runE2EAssert(t, "assert:phase-markers-preserved", func(t *testing.T) {
+			require.Equal(t, phaseStateBefore, captureE2EPhaseState(stateDir, id))
+		})
+		runE2EAssert(t, "assert:gateway-runtime-preserved", func(t *testing.T) {
+			require.Equal(t, sidecarStateBefore, e2eDockerContainerState(t, sidecar))
 		})
 	})
 
@@ -264,8 +441,12 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 		runE2EAssert(t, "assert:gateway-started", func(t *testing.T) {
 			assertE2EGatewayRuntimeRunning(t, state, lab, orch)
 		})
+		runE2EAssert(t, "assert:gateway-models-priced", func(t *testing.T) {
+			assertE2EGatewayModelsPriced(t, state, lab, orch)
+		})
 	})
 
+	runE2EScriptDryRunStep(t, "taxiway:workspace[--dry-run]", root, tb, state, stateDir, id, false, dryRunLabels.Workspace, "workspace", lab)
 	runE2EStep(t, "taxiway:workspace", func(t *testing.T) {
 		runE2ECommand(t, root, tb, "workspace", lab)
 		runE2EAssert(t, "assert:phase-workspace-created", func(t *testing.T) {
@@ -284,6 +465,21 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 		})
 	})
 
+	runE2EScriptDryRunStep(t, "taxiway:auth[--dry-run]", root, tb, state, stateDir, id, false, dryRunLabels.Auth, "auth", lab)
+	runE2EStep(t, "taxiway:auth", func(t *testing.T) {
+		runE2ECommand(t, root, tb, "auth", lab, "--set", "auth_mode=api-key")
+		runE2EAssert(t, "assert:phase-authenticated", func(t *testing.T) {
+			assertE2EPhase(t, stateDir, id, phases.PhaseAuth)
+		})
+	})
+
+	if orch != "codex" {
+		runE2EStep(t, "fixture:complete-native-onboarding", func(t *testing.T) {
+			configureE2ECompletedClaudeOnboarding(t, state, id, orch)
+		})
+	}
+
+	runE2EScriptDryRunStep(t, "taxiway:start[--dry-run]", root, tb, state, stateDir, id, false, dryRunLabels.Start, "start", lab)
 	runE2EStep(t, "taxiway:start", func(t *testing.T) {
 		runE2ECommand(t, root, tb, "start", lab)
 		runE2EAssert(t, "assert:phase-started", func(t *testing.T) {
@@ -295,9 +491,20 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 		runE2EAssert(t, "assert:gateway-routed", func(t *testing.T) {
 			assertE2EGatewayRequestRouted(t, state, lab, orch, fakeUpstream)
 		})
+		runE2EAssert(t, "assert:gateway-protocol-preserved", func(t *testing.T) {
+			assertE2EGatewayProtocol(t, state, lab, orch, fakeUpstream)
+		})
 		runE2EAssert(t, "assert:trace-ingested", func(t *testing.T) {
 			assertE2EObservabilityTraceIngested(t, state, lab, orch)
 		})
+		runE2EAssert(t, "assert:generation-cost-provided", func(t *testing.T) {
+			assertE2EGenerationCostProvided(t, state, lab, orch)
+		})
+		runE2EAssert(t, "assert:shell-target-ready", func(t *testing.T) {
+			assertE2EShellCheck(t, root, tb, lab, orch)
+		})
+		assertE2EStartedAgents(t, state, id, orch)
+
 	})
 
 	runE2EStep(t, "taxiway:observe[down]", func(t *testing.T) {
@@ -316,14 +523,66 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 		})
 	})
 
-	runE2EStep(t, e2eCommandStepAt("after-start", "shell", "--check"), func(t *testing.T) {
-		assertE2EShellCheck(t, root, tb, lab, orch)
-	})
-	assertE2EStartedAgents(t, state, id, orch, "after-start")
+	if expectations.readinessActions != nil {
+		expectations.readinessActions(t, state, id, "after-start")
+	} else {
+		runE2EStep(t, "agent:send[controlled-readiness-probe]@after-start", func(t *testing.T) {
+			observation := runE2EInteractiveProbe(t, state, id, "", orch)
+			runE2EAssert(t, "assert:interactive-response-completed", func(t *testing.T) {
+				assertE2EInteractiveObservation(t, observation, false)
+			})
+		})
+	}
 
 	runE2EStep(t, e2eCommandStepAt("after-start", "doctor"), func(t *testing.T) {
 		runE2ECommand(t, root, tb, "doctor", lab)
 	})
+
+	for _, args := range [][]string{{"destroy", "--yes", "--dry-run"}, {"observe", "rm", "--volumes", "--dry-run"}, {"observe", "reset", "--rotate-secrets", "--dry-run"}} {
+		runE2EStep(t, "taxiway:"+strings.Join(args, " ")+"[rejected]", func(t *testing.T) {
+			phaseStateBefore := captureE2EPhaseState(stateDir, id)
+			_, _, err := execDockerRoot(t, root, tb, args...)
+			require.ErrorContains(t, err, "unknown flag: --dry-run")
+			runE2EAssert(t, "assert:runtime-preserved", func(t *testing.T) {
+				running, err := state.Driver.Running(context.Background(), id)
+				require.NoError(t, err)
+				require.True(t, running)
+				assertE2EGatewayRuntimeRunning(t, state, lab, orch)
+				assertE2EObservabilityRunning(t, state)
+				require.Equal(t, phaseStateBefore, captureE2EPhaseState(stateDir, id))
+			})
+		})
+	}
+
+	var downFrozen bool
+	var downResume func(*testing.T)
+	if expectations.readinessActions == nil {
+		runE2EStep(t, "fixture:quiesce-owned-agent-before-down-preview", func(fixtureT *testing.T) {
+			downFrozen, downResume = quiesceE2EDryRunAgent(t, fixtureT, state, id, orch)
+		})
+	}
+	runE2EStep(t, "taxiway:down[--dry-run]", func(t *testing.T) {
+
+		runningBefore, err := state.Driver.Running(context.Background(), id)
+		require.NoError(t, err)
+		ref := config.LabRef{Lab: lab, Orch: orch, Driver: state.Driver.Name()}
+		sidecar := e2eLabLiteLLMContainer(state, ref)
+		sidecarStateBefore := e2eDockerContainerState(t, sidecar)
+		output := runE2EDryRunCommand(t, root, tb, state, downFrozen, "down", lab)
+		require.Contains(t, output, "Stopping lab runtime")
+		require.Contains(t, output, "Stopping LiteLLM sidecar")
+		runE2EAssert(t, "assert:lab-runtime-preserved", func(t *testing.T) {
+			runningAfter, err := state.Driver.Running(context.Background(), id)
+			require.NoError(t, err)
+			require.Equal(t, runningBefore, runningAfter)
+		})
+		runE2EAssert(t, "assert:gateway-runtime-preserved", func(t *testing.T) {
+			require.Equal(t, sidecarStateBefore, e2eDockerContainerState(t, sidecar))
+		})
+	})
+	if downResume != nil {
+		runE2EStep(t, "fixture:resume-owned-agent-after-down-preview", func(t *testing.T) { downResume(t) })
+	}
 
 	runE2EStep(t, "taxiway:down", func(t *testing.T) {
 		runE2ECommand(t, root, tb, "down", lab)
@@ -332,27 +591,62 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 		})
 	})
 
+	runE2EStep(t, e2eCommandStepAt("after-down", "up", "--type="+orch, "--skip-auth-check", "--dry-run"), func(t *testing.T) {
+		runningBefore, err := state.Driver.Running(context.Background(), id)
+		require.NoError(t, err)
+		ref := config.LabRef{Lab: lab, Orch: orch, Driver: state.Driver.Name()}
+		sidecar := e2eLabLiteLLMContainer(state, ref)
+		sidecarStateBefore := e2eDockerContainerState(t, sidecar)
+		runE2EDryRunCommand(t, root, tb, state, false, "up", lab, "--type", orch, "--skip-auth-check")
+		runE2EAssert(t, "assert:lab-runtime-preserved", func(t *testing.T) {
+			runningAfter, err := state.Driver.Running(context.Background(), id)
+			require.NoError(t, err)
+			require.Equal(t, runningBefore, runningAfter)
+		})
+		runE2EAssert(t, "assert:gateway-runtime-preserved", func(t *testing.T) {
+			require.Equal(t, sidecarStateBefore, e2eDockerContainerState(t, sidecar))
+		})
+	})
+
 	runE2EStep(t, e2eCommandStepAt("after-down", "up", "--type="+orch, "--skip-auth-check"), func(t *testing.T) {
 		runE2ECommand(t, root, tb, "up", lab, "--type", orch, "--skip-auth-check")
 		runE2EAssert(t, "assert:lab-listed", func(t *testing.T) {
 			assertE2EList(t, root, tb, lab, orch, "running", "started")
 		})
+		runE2EAssert(t, "assert:gateway-models-priced", func(t *testing.T) {
+			assertE2EGatewayModelsPriced(t, state, lab, orch)
+		})
 		runE2EAssert(t, "assert:gateway-routed", func(t *testing.T) {
 			assertE2EGatewayRequestRouted(t, state, lab, orch, fakeUpstream)
+		})
+		runE2EAssert(t, "assert:gateway-protocol-preserved", func(t *testing.T) {
+			assertE2EGatewayProtocol(t, state, lab, orch, fakeUpstream)
 		})
 		runE2EAssert(t, "assert:trace-ingested", func(t *testing.T) {
 			assertE2EObservabilityTraceIngested(t, state, lab, orch)
 		})
+		runE2EAssert(t, "assert:shell-target-ready", func(t *testing.T) {
+			assertE2EShellCheck(t, root, tb, lab, orch)
+		})
+		assertE2EStartedAgents(t, state, id, orch)
+
 	})
 
-	runE2EStep(t, e2eCommandStepAt("after-up", "shell", "--check"), func(t *testing.T) {
-		assertE2EShellCheck(t, root, tb, lab, orch)
-	})
-	assertE2EStartedAgents(t, state, id, orch, "after-up")
-	if expectations.checkHandoff != nil {
-		runE2EStep(t, "orchestrator:handoff", func(t *testing.T) {
-			expectations.checkHandoff(t, state, id)
+	if expectations.readinessActions != nil {
+		expectations.readinessActions(t, state, id, "after-up")
+	} else {
+		runE2EStep(t, "agent:send[controlled-readiness-probe]@after-up", func(t *testing.T) {
+			observation := runE2EInteractiveProbe(t, state, id, "", orch)
+			runE2EAssert(t, "assert:interactive-response-completed", func(t *testing.T) {
+				assertE2EInteractiveObservation(t, observation, false)
+			})
 		})
+	}
+	if expectations.checkHandoff != nil {
+		expectations.checkHandoff(t, state, id)
+		if expectations.readinessActions != nil {
+			expectations.readinessActions(t, state, id, "after-handoff")
+		}
 	}
 
 	runE2EStep(t, e2eCommandStepAt("after-up", "doctor"), func(t *testing.T) {
@@ -361,13 +655,96 @@ func testE2EOrchestratorPhaseByPhase(t *testing.T, orch string) {
 
 	runE2ERecordScenario(t, root, tb, state, lab, orch)
 
+	runE2EStep(t, "taxiway:reset[confirmation-required]", func(t *testing.T) {
+		before, err := os.ReadDir(phases.Dir(stateDir, id))
+		require.NoError(t, err)
+		require.NotEmpty(t, before)
+		_, _, err = execDockerRoot(t, root, tb, "reset", lab)
+		require.ErrorContains(t, err, "--yes")
+		for _, input := range []string{"printf 'n\\n' |", "true |"} {
+			var output bytes.Buffer
+			result, err := state.Driver.Exec(context.Background(), id, driver.ExecRequest{
+				Argv:   []string{"bash", "-lc", input + " bash /lab/infra/commands/reset.sh"},
+				Stdout: &output,
+			})
+			require.NoError(t, err)
+			require.Equal(t, 0, result.ExitCode)
+			require.Contains(t, output.String(), "Aborted.")
+		}
+		after, err := os.ReadDir(phases.Dir(stateDir, id))
+		require.NoError(t, err)
+		require.Equal(t, before, after)
+		assertE2EFixtureWorkspace(t, state, id, orch)
+	})
+
+	var resetFrozen bool
+	var resetResume func(*testing.T)
+	if expectations.readinessActions == nil {
+		runE2EStep(t, "fixture:quiesce-owned-agent-before-reset-preview", func(fixtureT *testing.T) {
+			resetFrozen, resetResume = quiesceE2EDryRunAgent(t, fixtureT, state, id, orch)
+		})
+	}
+	runE2EStep(t, "taxiway:reset[--yes,--dry-run]", func(t *testing.T) {
+
+		phaseStateBefore := captureE2EPhaseState(stateDir, id)
+		output := runE2EDryRunCommand(t, root, tb, state, resetFrozen, "reset", "--yes", lab)
+		if expectations.resetStopLabel != "" {
+			require.Contains(t, output, expectations.resetStopLabel)
+			require.Less(t, strings.Index(output, expectations.resetStopLabel), strings.Index(output, "Clearing /lab/work contents"),
+				"the adapter stops its services before reset clears the workspace")
+		}
+		require.Contains(t, output, "Clearing /lab/work contents")
+		require.Contains(t, output, "Clearing lifecycle phase markers")
+		require.Equal(t, 1, strings.Count(output, "No changes were made."))
+		runE2EAssert(t, "assert:phase-markers-preserved", func(t *testing.T) { require.Equal(t, phaseStateBefore, captureE2EPhaseState(stateDir, id)) })
+	})
+	if resetResume != nil {
+		runE2EStep(t, "fixture:resume-owned-agent-after-reset-preview", func(t *testing.T) { resetResume(t) })
+	}
 	runE2EStep(t, "taxiway:reset[--yes]", func(t *testing.T) {
 		runE2ECommand(t, root, tb, "reset", "--yes", lab)
+		_, err := os.Stat(phases.Dir(stateDir, id))
+		require.True(t, os.IsNotExist(err), "successful reset clears lifecycle markers")
+		if expectations.assertServicesStopped != nil {
+			runE2EAssert(t, "assert:orchestrator-services-stopped", func(t *testing.T) {
+				expectations.assertServicesStopped(t, state, id)
+			})
+		}
 		runE2EAssert(t, "assert:lab-listed", func(t *testing.T) {
 			assertE2EList(t, root, tb, lab, orch, "degraded", "-")
 		})
 	})
 
+	var rmFrozen bool
+	var rmResume func(*testing.T)
+	if expectations.readinessActions == nil {
+		runE2EStep(t, "fixture:quiesce-owned-agent-before-rm-preview", func(fixtureT *testing.T) {
+			rmFrozen, rmResume = quiesceE2EDryRunAgent(t, fixtureT, state, id, orch)
+		})
+	}
+	runE2EStep(t, "taxiway:rm[--yes,--dry-run]", func(t *testing.T) {
+
+		existedBefore, err := state.Driver.Exists(context.Background(), id)
+		require.NoError(t, err)
+		ref := config.LabRef{Lab: lab, Orch: orch, Driver: state.Driver.Name()}
+		sidecar := e2eLabLiteLLMContainer(state, ref)
+		sidecarStateBefore := e2eDockerContainerState(t, sidecar)
+		output := runE2EDryRunCommand(t, root, tb, state, rmFrozen, "rm", "--yes", lab)
+		require.Contains(t, output, "Deleting lab runtime and storage")
+		require.Contains(t, output, "Clearing lifecycle phase markers")
+		runE2EAssert(t, "assert:lab-runtime-preserved", func(t *testing.T) {
+			existsAfter, err := state.Driver.Exists(context.Background(), id)
+			require.NoError(t, err)
+			require.Equal(t, existedBefore, existsAfter)
+		})
+		runE2EAssert(t, "assert:gateway-runtime-preserved", func(t *testing.T) {
+			require.Equal(t, sidecarStateBefore, e2eDockerContainerState(t, sidecar))
+		})
+	})
+
+	if rmResume != nil {
+		runE2EStep(t, "fixture:resume-owned-agent-after-rm-preview", func(t *testing.T) { rmResume(t) })
+	}
 	runE2EStep(t, "taxiway:rm[--yes]", func(t *testing.T) {
 		runE2ECommand(t, root, tb, "rm", "--yes", lab)
 		runE2EAssert(t, "assert:lab-removed", func(t *testing.T) {
@@ -394,11 +771,12 @@ func testE2EOrchestratorUp(t *testing.T, orch string) {
 	configureE2EScenarioEnvironment(t, scope)
 	id := uniqueDockerID(t, orch, "up")
 	lab := labNameFromID(id)
-	fakeUpstream := startE2EFakeOpenAIUpstream(t)
+	fakeUpstream := startE2EFakeModelUpstream(t)
 	root, state, tb := buildRealOrchestratorDockerRoot(t, orch, scope)
 	cleanupE2EOrchestratorLab(t, state, id, lab, orch)
-	configureE2ELiteLLMModelCatalog(t, state, fakeUpstream)
+	configureE2ELiteLLMModelCatalog(t, state, fakeUpstream.baseURL)
 	stateDir := config.StateDir(state.Flags.StateDir, state.RepoDir)
+	runE2EInvalidModelSelections(t, root, tb, state, id, lab, orch)
 
 	runE2EStep(t, "taxiway:init", func(t *testing.T) {
 		ensureE2ERuntimeInitialized(t, root, tb)
@@ -408,7 +786,11 @@ func testE2EOrchestratorUp(t *testing.T, orch string) {
 	})
 
 	runE2EStep(t, fmt.Sprintf("taxiway:up[--type=%s,--repo=<fixture>,--skip-auth-check]", orch), func(t *testing.T) {
-		runE2ECommand(t, root, tb, "up", lab, "--type", orch, "--repo", e2eFixtureRepoURL, "--skip-auth-check")
+		args := []string{"up", lab, "--type", orch, "--repo", e2eFixtureRepoURL, "--skip-auth-check", "--set", "auth_mode=api-key", "--set", "model=" + expectations.model, "--set", e2eHarnessPin(orch)}
+		for _, setting := range expectations.upSettings {
+			args = append(args, "--set", setting)
+		}
+		runE2ECommand(t, root, tb, args...)
 		runE2EAssert(t, "assert:phase-started", func(t *testing.T) {
 			assertE2EPhase(t, stateDir, id, phases.PhaseStart)
 		})
@@ -424,18 +806,83 @@ func testE2EOrchestratorUp(t *testing.T, orch string) {
 		runE2EAssert(t, "assert:gateway-started", func(t *testing.T) {
 			assertE2EGatewayRuntimeRunning(t, state, lab, orch)
 		})
+		runE2EAssert(t, "assert:gateway-models-priced", func(t *testing.T) {
+			assertE2EGatewayModelsPriced(t, state, lab, orch)
+		})
 		runE2EAssert(t, "assert:gateway-routed", func(t *testing.T) {
 			assertE2EGatewayRequestRouted(t, state, lab, orch, fakeUpstream)
+		})
+		runE2EAssert(t, "assert:gateway-protocol-preserved", func(t *testing.T) {
+			assertE2EGatewayProtocol(t, state, lab, orch, fakeUpstream)
 		})
 		runE2EAssert(t, "assert:trace-ingested", func(t *testing.T) {
 			assertE2EObservabilityTraceIngested(t, state, lab, orch)
 		})
+		runE2EAssert(t, "assert:generation-cost-provided", func(t *testing.T) {
+			assertE2EGenerationCostProvided(t, state, lab, orch)
+		})
+		if orch == "codex" {
+			runE2EAssert(t, "assert:shell-target-ready", func(t *testing.T) { assertE2EShellCheck(t, root, tb, lab, orch) })
+
+			assertE2EStartedAgents(t, state, id, orch)
+		}
+
 	})
 
-	runE2EStep(t, "taxiway:shell[--check]", func(t *testing.T) {
-		assertE2EShellCheck(t, root, tb, lab, orch)
-	})
-	assertE2EStartedAgents(t, state, id, orch, "after-start")
+	if orch == "claude-code" {
+		runE2EStep(t, "agent:send[first-run-readiness-probe]", func(t *testing.T) {
+			observation := runE2EInteractiveProbe(t, state, id, "", orch)
+			runE2EAssert(t, "assert:first-run-dialog-rejects-readiness", func(t *testing.T) {
+				assertE2EInteractiveObservation(t, observation, true)
+			})
+		})
+	}
+	if orch != "codex" {
+		runE2EStep(t, "fixture:pause-before-native-onboarding", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			script := "tmux kill-session -t claude-code"
+			if orch == "gastown" {
+				// Native reversible pause preserves workspaces. Force only stops
+				// owned guest processes, avoiding keystrokes into first-run dialogs.
+				script = "cd /lab/work/gt && gt down --quiet --force"
+			}
+			if orch == "gascity" {
+				// Native stop keeps the city and its durable sessions.
+				// gc stop can time out on its bead store's proxy lock while a
+				// patrol holds it; one bounded retry keeps the first error on stderr.
+				script = `export PATH="$HOME/.local/bin:$PATH"; cd /lab/work/gc &&
+{ timeout 180 gc stop --force /lab/work/gc || { echo "retrying gc stop once" >&2; sleep 5; timeout 180 gc stop --force /lab/work/gc; }; } &&
+timeout 120 gc supervisor stop --wait`
+			}
+			var stderr bytes.Buffer
+			res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: []string{"bash", "-lc", script}, Stderr: &stderr})
+			require.NoError(t, err)
+			require.Zero(t, res.ExitCode, redactE2EDiagnosticSecrets(stderr.String()))
+			if strings.Contains(stderr.String(), "retrying gc stop once") {
+				t.Logf("gc stop needed its retry; first attempt: %s", redactE2EDiagnosticSecrets(stderr.String()))
+			}
+		})
+		runE2EStep(t, "fixture:complete-native-onboarding", func(t *testing.T) {
+			configureE2ECompletedClaudeOnboarding(t, state, id, orch)
+		})
+		runE2EStep(t, "taxiway:start[completed-native-onboarding-fixture]", func(t *testing.T) {
+			runE2ECommand(t, root, tb, "start", lab)
+			runE2EAssert(t, "assert:shell-target-ready", func(t *testing.T) { assertE2EShellCheck(t, root, tb, lab, orch) })
+			assertE2EStartedAgents(t, state, id, orch)
+		})
+	}
+
+	if expectations.readinessActions != nil {
+		expectations.readinessActions(t, state, id, "after-start")
+	} else {
+		runE2EStep(t, "agent:send[controlled-readiness-probe]", func(t *testing.T) {
+			observation := runE2EInteractiveProbe(t, state, id, "", orch)
+			runE2EAssert(t, "assert:interactive-response-completed", func(t *testing.T) {
+				assertE2EInteractiveObservation(t, observation, false)
+			})
+		})
+	}
 
 	runE2EStep(t, "taxiway:doctor", func(t *testing.T) {
 		runE2ECommand(t, root, tb, "doctor", lab)
@@ -466,6 +913,7 @@ func buildRealOrchestratorDockerRoot(t *testing.T, orch, scope string) (*cobra.C
 	require.NoError(t, os.MkdirAll(stateDir, 0o700))
 
 	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "infra"), 0o755))
+	copyRuntimeTree(t, filepath.Join("infra", "agents"), filepath.Join(tmp, "infra", "agents"))
 	copyRuntimeTree(t, filepath.Join("infra", "commands"), filepath.Join(tmp, "infra", "commands"))
 	copyRuntimeTree(t, filepath.Join("infra", "gateway"), filepath.Join(tmp, "infra", "gateway"))
 	copyRuntimeTree(t, filepath.Join("infra", "observability"), filepath.Join(tmp, "infra", "observability"))
@@ -476,7 +924,6 @@ func buildRealOrchestratorDockerRoot(t *testing.T, orch, scope string) (*cobra.C
 	for _, agent := range e2eAgents(t, tmp, orch) {
 		copyRuntimeTree(t, filepath.Join("agents", agent), filepath.Join(tmp, "agents", agent))
 	}
-
 	d := driver.NewDockerDriver(stateDir)
 	state := &RootState{
 		RepoDir: tmp,
@@ -493,6 +940,15 @@ func buildRealOrchestratorDockerRoot(t *testing.T, orch, scope string) (*cobra.C
 	root := &cobra.Command{Use: "taxiway", SilenceUsage: true}
 	root.SetOut(&tb.out)
 	root.SetErr(&tb.err)
+	root.PersistentPreRun = func(_ *cobra.Command, _ []string) {
+		state.Driver = d
+		if state.Flags.DryRun {
+			state.Driver = driver.NewDryRun(d)
+		}
+	}
+	root.PersistentPostRun = func(_ *cobra.Command, _ []string) {
+		state.Driver = d
+	}
 	root.AddCommand(
 		newUpCmd(state),
 		newPrepareCmd(state),
@@ -526,14 +982,307 @@ func buildRealOrchestratorDockerRoot(t *testing.T, orch, scope string) (*cobra.C
 func cleanupE2EOrchestratorLab(t *testing.T, state *RootState, id, lab, orch string) {
 	t.Helper()
 	t.Cleanup(func() {
-		ref := config.LabRef{Lab: lab, Orch: orch, Driver: state.Driver.Name()}
+		cleanupDriver := driver.NewDockerDriver(config.StateDir(state.Flags.StateDir, state.RepoDir))
+		state.Driver = cleanupDriver
+		ref := config.LabRef{Lab: lab, Orch: orch, Driver: cleanupDriver.Name()}
 		if err := removeLabLiteLLMSidecar(context.Background(), state, ref); err != nil {
 			t.Logf("cleanup LiteLLM sidecar for %s: %v", lab, err)
 		}
-		if err := state.Driver.Delete(context.Background(), id); err != nil {
+		if err := cleanupDriver.Delete(context.Background(), id); err != nil {
 			t.Logf("cleanup lab %s: %v", lab, err)
 		}
 	})
+}
+
+func quiesceE2EDryRunAgent(owner, t *testing.T, state *RootState, id, orch string) (bool, func(*testing.T)) {
+	t.Helper()
+	if orch != "codex" && orch != "claude-code" {
+		return false, func(*testing.T) {}
+	}
+	// A restarted native client writes and removes temporary/session files
+	// asynchronously, including after reset while rm preview takes its snapshot.
+	// Freeze only this fixture's pane process tree while checking that preview
+	// preserves every file, then resume even if the assertion fails.
+	var stopped bytes.Buffer
+	var stoppedErr bytes.Buffer
+	var sessionsBefore bytes.Buffer
+	var once sync.Once
+	resume := func(t *testing.T) {
+		once.Do(func() {
+			pids := strings.Fields(stopped.String())
+			if len(pids) == 0 {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			// Descendants resume before their tmux server.
+			for left, right := 0, len(pids)-1; left < right; left, right = left+1, right-1 {
+				pids[left], pids[right] = pids[right], pids[left]
+			}
+			var resumeErr bytes.Buffer
+			result, err := state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: append([]string{"bash", "-c", `set -u
+failed=0
+for pid in "$@"; do
+  if [[ -e /proc/$pid/stat ]] && ! kill -CONT "$pid"; then
+    # A terminated child is harmless; continue so the server always resumes.
+    [[ ! -e /proc/$pid/stat ]] || failed=1
+  fi
+done
+exit "$failed"`, "resume-owned-agent"}, pids...), Stderr: &resumeErr})
+			require.NoError(t, err)
+			require.Zero(t, result.ExitCode, "resume this fixture's suspended processes: %s", resumeErr.String())
+			var sessionsAfter bytes.Buffer
+			result, err = state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: []string{"tmux", "list-sessions", "-F", "session|#{session_name}|#{session_id}"}, Stdout: &sessionsAfter})
+			require.NoError(t, err)
+			require.Zero(t, result.ExitCode)
+			require.Equal(t, sessionsBefore.String(), sessionsAfter.String(), "preview preserves native tmux sessions across verified quiescence")
+			var paneAfter bytes.Buffer
+			result, err = state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: []string{"tmux", "display-message", "-p", "-t", orch, "#{pane_dead}"}, Stdout: &paneAfter})
+			require.NoError(t, err)
+			require.Zero(t, result.ExitCode)
+			require.Equal(t, "0", strings.TrimSpace(paneAfter.String()), "native fixture remains alive after resume")
+		})
+	}
+	owner.Cleanup(func() { resume(owner) })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: []string{"tmux", "list-sessions", "-F", "session|#{session_name}|#{session_id}"}, Stdout: &sessionsBefore})
+	require.NoError(t, err)
+	require.Zero(t, result.ExitCode)
+	result, err = state.Driver.Exec(ctx, id, driver.ExecRequest{
+		Argv: []string{"bash", "-c", `set -euo pipefail
+freeze_tree() {
+  kill -STOP "$1"
+  printf '%s\n' "$1"
+  local deadline=$((SECONDS + 5)) state
+  while [[ -e /proc/$1/stat ]]; do
+    stat=$(cat "/proc/$1/stat")
+    fields="${stat##*) }"
+    state="${fields%% *}"
+    [[ "$state" != Z ]] || return 0 # Already terminated; cannot write files.
+    [[ "$state" == T || "$state" == t ]] && break
+    (( SECONDS < deadline )) || { printf 'owned PID %s did not stop (state=%s)\n' "$1" "$state" >&2; return 1; }
+    sleep 0.05
+  done
+  [[ -e /proc/$1/stat ]] || return 0
+  [[ -r /proc/$1/task/$1/children ]] || {
+    printf 'snapshot quiescence requires readable /proc/PID/task/PID/children (CONFIG_PROC_CHILDREN)\n' >&2
+    return 1
+  }
+  local child children
+  children=$(cat "/proc/$1/task/$1/children")
+  for child in $children; do [[ ! -e /proc/$child/stat ]] || freeze_tree "$child"; done
+}
+pid=$(tmux display-message -p -t "$1" '#{pane_pid}')
+[[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 ))
+server=$(tmux display-message -p -t "$1" '#{pid}')
+[[ "$server" =~ ^[0-9]+$ ]] && (( server > 1 ))
+python3 - "$pid" "$server" <<'PY'
+import os, pathlib, sys
+pane, server = sys.argv[1:]
+assert pathlib.Path('/proc', server).stat().st_uid == os.getuid(), 'server must belong to this fixture user'
+assert pathlib.Path('/proc', server, 'comm').read_text().strip().startswith('tmux'), 'owned parent must be tmux'
+assert pathlib.Path('/proc', pane, 'stat').read_text().rsplit(')', 1)[1].split()[1] == server, 'pane must be child of this owned server'
+PY
+# tmux resumes stopped pane leaders; freeze this owned server first.
+freeze_tree "$server"`, "freeze-owned-agent", orch},
+		Stdout: &stopped,
+		Stderr: &stoppedErr,
+	})
+	require.NoError(t, err)
+	require.Zero(t, result.ExitCode, "freeze owned pane: %s", stoppedErr.String())
+	require.NotEmpty(t, strings.Fields(stopped.String()))
+	var metadata bytes.Buffer
+	result, err = state.Driver.Exec(ctx, id, driver.ExecRequest{
+		Argv: []string{"python3", "-c", `import pathlib, sys
+for pid in ' '.join(sys.argv[1:]).split():
+    path = pathlib.Path('/proc') / pid / 'stat'
+    if path.exists():
+        fields = path.read_text().rsplit(')', 1)[1].split()
+        print('suspended PID=%s PPID=%s state=%s' % (pid, fields[1], fields[0]))
+    else:
+        print('suspended PID=%s missing' % pid)
+for path in (pathlib.Path.home() / '.claude/sessions').glob('*.json'):
+    pid = path.stem
+    stat = pathlib.Path('/proc') / pid / 'stat'
+    fields = stat.read_text().rsplit(')', 1)[1].split() if stat.exists() else []
+    print('session PID=%s state=%s' % (pid, fields[0] if fields else 'missing'))
+`, strings.TrimSpace(stopped.String())}, Stdout: &metadata,
+	})
+	require.NoError(t, err)
+	require.Zero(t, result.ExitCode)
+	t.Log(metadata.String())
+	return true, resume
+}
+
+func runE2EDryRunCommand(t *testing.T, root *cobra.Command, tb *dockerTestBuf, state *RootState, frozenTmux bool, args ...string) string {
+	t.Helper()
+	before := captureE2EDryRunRuntime(t, state, frozenTmux)
+	dryRunArgs := append(append([]string(nil), args...), "--dry-run")
+	output := runE2ECommand(t, root, tb, dryRunArgs...)
+	runE2EAssert(t, "assert:runtime-and-files-preserved", func(t *testing.T) {
+		after := captureE2EDryRunRuntime(t, state, frozenTmux)
+		var changed []string
+		for path, digest := range before {
+			if after[path] != digest {
+				changed = append(changed, path)
+			}
+		}
+		for path := range after {
+			if _, existed := before[path]; !existed {
+				changed = append(changed, path)
+			}
+		}
+		sort.Strings(changed)
+		require.Empty(t, changed, "preview must preserve Docker resources, credentials, gateway configuration, lab settings, and workspace files")
+	})
+	return output
+}
+
+func captureE2EDryRunRuntime(t *testing.T, state *RootState, frozenTmux bool) map[string]string {
+	t.Helper()
+	hash := sha256.New()
+	stateDir := config.StateDir(state.Flags.StateDir, state.RepoDir)
+	for _, directory := range []string{stateDir, authStateDir(state), state.proxyRuntime().StateDir, observabilityStateDir(state)} {
+		err := filepath.WalkDir(directory, func(path string, entry os.DirEntry, err error) error {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(hash, "%s %s\n", path, info.Mode())
+			if info.Mode().IsRegular() {
+				contents, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				_, _ = hash.Write(contents)
+			}
+			return nil
+		})
+		require.NoError(t, err)
+	}
+	prefix := "taxiway-e2e-" + state.Observability.ContextID
+	for _, args := range [][]string{
+		{"ps", "-a", "--filter", "name=" + prefix, "--format", "{{.ID}} {{.Names}} {{.State}}"},
+		{"network", "ls", "--filter", "name=" + prefix, "--format", "{{.ID}} {{.Name}}"},
+		{"volume", "ls", "--filter", "name=" + prefix, "--format", "{{.Name}}"},
+	} {
+		output, err := exec.Command("docker", args...).Output()
+		require.NoError(t, err)
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		sort.Strings(lines)
+		fmt.Fprintln(hash, strings.Join(lines, "\n"))
+	}
+	snapshot := map[string]string{"host state and Docker resources": fmt.Sprintf("%x", hash.Sum(nil))}
+	refs, err := collectDestroyLabRefs(stateDir)
+	require.NoError(t, err)
+	d := driver.NewDockerDriver(stateDir)
+	for _, ref := range refs {
+		id := idName(ref.Lab)
+		running, err := d.Running(context.Background(), id)
+		require.NoError(t, err)
+		if !running {
+			continue
+		}
+		var output, diagnostic bytes.Buffer
+		result, err := d.Exec(context.Background(), id, driver.ExecRequest{
+			Argv: []string{"bash", "-c", `set -euo pipefail
+operation=initialization
+trap 'printf "snapshot operation=%s exit=%s\n" "$operation" "$?" >&2' ERR
+# GasTown's running database and daemon logs, and Codex's scratch directory,
+# change independently of previews; so do Codex's log databases and SQLite
+# journals, excluded below.
+runtime=(-path /lab/work/gt/.dolt-data -o -path /lab/work/gt/daemon -o -path "$HOME/.codex/.tmp")
+volatile=(! -path "$HOME/.codex/logs_*.sqlite*" ! -path "$HOME/.codex/*.sqlite-wal" ! -path "$HOME/.codex/*.sqlite-shm")
+if [[ "$2" == gascity ]]; then
+  # Gas City's controller, bead stores and its agents' Claude transcripts also
+  # change on their own schedules (patrols, orders, dogs).
+  runtime+=(-o -path /lab/work/gc/.gc -o -path '/lab/work/*/.beads'
+    -o -path "$HOME/.claude/projects" -o -path "$HOME/.claude/sessions" -o -path "$HOME/.claude/todos"
+    -o -path "$HOME/.claude/shell-snapshots" -o -path "$HOME/.claude/file-history" -o -path "$HOME/.claude/statsig"
+    -o -path "$HOME/.claude/history.jsonl")
+fi
+for path in "$HOME/.config/taxiway" "$HOME/.codex" "$HOME/.claude" /lab/work; do
+  if [ -d "$path" ]; then
+    # Keep runtime directory presence while hashing persistent configuration and workspace files.
+    operation=directory-modes
+    find "$path" \( "${runtime[@]}" \) -printf 'mode|%m|%p\n' -prune -o "${volatile[@]}" -printf 'mode|%m|%p\n'
+    operation=file-digests
+    find "$path" \( "${runtime[@]}" \) -prune -o -type f ! -path /lab/work/gt/.runtime/doctor-fix.log "${volatile[@]}" -exec sha256sum {} +
+  fi
+done
+if [[ "$1" != frozen ]] && command -v tmux >/dev/null 2>&1; then
+  tmux list-sessions -F 'session|#{session_name}|#{session_id}' 2>/dev/null || true
+fi`, "capture-preview", map[bool]string{true: "frozen", false: "active"}[frozenTmux], ref.Orch},
+			Stdout: &output,
+			Stderr: &diagnostic,
+		})
+		message := redactE2EDiagnosticSecrets(diagnostic.String())
+		if len(message) > 4096 {
+			message = "[truncated] " + message[len(message)-4096:]
+		}
+		require.NoError(t, err, "snapshot lab %s: %s", ref.Lab, message)
+		require.Zero(t, result.ExitCode, "snapshot lab %s: %s", ref.Lab, message)
+		for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+			if strings.HasPrefix(line, "session|") {
+				fields := strings.SplitN(line, "|", 3)
+				snapshot[ref.Lab+":tmux:"+fields[1]] = fields[2]
+			} else if strings.HasPrefix(line, "mode|") {
+				fields := strings.SplitN(line, "|", 3)
+				key := ref.Lab + ":" + fields[2]
+				snapshot[key] = fields[1]
+			} else if len(line) > 66 {
+				key := ref.Lab + ":" + line[66:]
+				snapshot[key] += ":" + line[:64]
+			}
+		}
+	}
+	return snapshot
+}
+
+func runE2EScriptDryRunStep(
+	t *testing.T,
+	stepName string,
+	root *cobra.Command,
+	tb *dockerTestBuf,
+	state *RootState,
+	stateDir, id string,
+	frozenTmux bool,
+	expected []string,
+	args ...string,
+) {
+	t.Helper()
+	require.NotEmpty(t, args)
+	phaseStateBefore := captureE2EPhaseState(stateDir, id)
+	runE2EStep(t, stepName, func(t *testing.T) {
+		output := runE2EDryRunCommand(t, root, tb, state, frozenTmux, args...)
+		for _, label := range expected {
+			require.Contains(t, output, label)
+		}
+		require.Equal(t, 1, strings.Count(output, "No changes were made."))
+		runE2EAssert(t, "assert:phase-markers-preserved", func(t *testing.T) {
+			require.Equal(t, phaseStateBefore, captureE2EPhaseState(stateDir, id))
+		})
+	})
+}
+
+func captureE2EPhaseState(stateDir, id string) []bool {
+	state := make([]bool, len(phases.Order))
+	for i, phase := range phases.Order {
+		state[i] = phases.Done(stateDir, id, phase)
+	}
+	return state
+}
+
+func e2eLabLiteLLMContainer(state *RootState, ref config.LabRef) string {
+	proxy := state.proxyRuntime()
+	return labLiteLLMComposeProject(proxy.Context, proxy.ContextID, ref.Lab) + "-litellm-1"
 }
 
 func e2eOrchestratorScope(orch, action string) string {
@@ -546,6 +1295,35 @@ func e2eAgents(t *testing.T, repoDir, orch string) []string {
 	require.NoError(t, err)
 	require.NotNil(t, manifest)
 	return manifest.Agents
+}
+
+func runE2EInvalidModelSelections(t *testing.T, root *cobra.Command, tb *dockerTestBuf, state *RootState, id, lab, orch string) {
+	t.Helper()
+	prefix := "claude"
+	if orch == "codex" {
+		prefix = "gpt"
+	}
+	for _, tc := range []struct{ model, message string }{
+		{prefix + "-e2e-unknown", "unknown LiteLLM model"},
+		{prefix + "-e2e-retired", "is retired"},
+	} {
+		runE2EStep(t, "taxiway:up[--type="+orch+",--set=model="+tc.model+",rejected]", func(t *testing.T) {
+			_, _, err := execDockerRoot(t, root, tb, "up", lab, "--type", orch, "--skip-auth-check", "--set", "model="+tc.model)
+			runE2EAssert(t, "assert:invalid-model-rejected", func(t *testing.T) {
+				require.ErrorContains(t, err, tc.message)
+				require.ErrorContains(t, err, tc.model)
+				if strings.Contains(tc.model, "retired") {
+					require.ErrorContains(t, err, "select ")
+				}
+			})
+			runE2EAssert(t, "assert:lab-and-state-absent", func(t *testing.T) {
+				exists, err := state.Driver.Exists(context.Background(), id)
+				require.NoError(t, err)
+				require.False(t, exists, "invalid selection must not create a lab")
+				require.NoDirExists(t, filepath.Join(config.StateDir(state.Flags.StateDir, state.RepoDir), lab), "invalid selection must not write lab state")
+			})
+		})
+	}
 }
 
 func runE2ECommand(t *testing.T, root *cobra.Command, tb *dockerTestBuf, args ...string) string {
@@ -637,9 +1415,7 @@ func assertE2EAgentsWorkspaceTrusted(t *testing.T, state *RootState, id, orch, w
 	agents := e2eAgents(t, state.RepoDir, orch)
 	require.NotEmpty(t, agents, "orchestrator must declare its agents")
 	for _, agent := range agents {
-		runE2EAssert(t, "agent:"+agent, func(t *testing.T) {
-			assertE2EAgentWorkspaceTrusted(t, state, id, agent, workspacePath)
-		})
+		assertE2EAgentWorkspaceTrusted(t, state, id, agent, workspacePath)
 	}
 }
 
@@ -677,22 +1453,257 @@ func assertE2EAgentWorkspaceTrusted(t *testing.T, state *RootState, id, agent, w
 		agent, workspacePath, stdout.String(), stderr.String())
 }
 
-func assertE2EStartedAgents(t *testing.T, state *RootState, id, orch, stage string) {
+// Use published, fixed harness releases so lifecycle scenarios verify real pins.
+func e2eHarnessPin(orch string) string {
+	if orch == "codex" {
+		return "codex-version=0.160.0"
+	}
+	return "claude-code-version=2.1.289"
+}
+
+func assertE2EStartedAgents(t *testing.T, state *RootState, id, orch string) {
 	t.Helper()
 	expectations := e2eExpectations(t, orch)
-	runE2EStep(t, "agents:workspace-trust@"+stage, func(t *testing.T) {
-		runE2EAssert(t, "assert:lab-work-trusted", func(t *testing.T) {
-			assertE2EAgentsWorkspaceTrusted(t, state, id, orch, LabWorkRoot)
+	runE2EAssert(t, "assert:agent-versions-pinned", func(t *testing.T) {
+		assertE2EAgentVersions(t, state, id, orch)
+	})
+	runE2EAssert(t, "assert:gateway-provider-models", func(t *testing.T) {
+		assertE2EGatewayModels(t, state, id, orch)
+	})
+	if orch == "codex" {
+		runE2EAssert(t, "assert:codex-selected-model-and-permissions", func(t *testing.T) {
+			assertE2ECodexModel(t, state, id)
+			var stderr bytes.Buffer
+			res, err := state.Driver.Exec(context.Background(), id, driver.ExecRequest{Argv: []string{"python3", "-c", `import pathlib, tomllib; c=tomllib.loads((pathlib.Path.home()/".codex/config.toml").read_text()); assert c["approval_policy"] == "never"; assert c["sandbox_mode"] == "danger-full-access"`}, Stderr: &stderr})
+			require.NoError(t, err)
+			require.Zero(t, res.ExitCode, "Codex autonomous contract: %s", stderr.String())
 		})
-		runE2EAssert(t, "assert:repository-trusted", func(t *testing.T) {
-			assertE2EAgentsWorkspaceTrusted(t, state, id, orch, expectations.workspace(t).repository)
+	}
+	if orch == "gascity" {
+		runE2EAssert(t, "assert:gascity-container-supervisor", func(t *testing.T) {
+			assertE2EGascityContainerSupervisor(t, state, id)
 		})
+	}
+	runE2EAssert(t, "assert:lab-work-trusted", func(t *testing.T) {
+		assertE2EAgentsWorkspaceTrusted(t, state, id, orch, LabWorkRoot)
+	})
+	runE2EAssert(t, "assert:repository-trusted", func(t *testing.T) {
+		assertE2EAgentsWorkspaceTrusted(t, state, id, orch, expectations.workspace(t).repository)
 	})
 	if expectations.assertSessions != nil {
-		runE2EStep(t, "orchestrator:sessions@"+stage, func(t *testing.T) {
+		runE2EAssert(t, "assert:orchestrator-sessions-healthy", func(t *testing.T) {
 			expectations.assertSessions(t, state, id)
 		})
 	}
+}
+
+func assertE2EAgentVersions(t *testing.T, state *RootState, id, orch string) {
+	t.Helper()
+	agent, requested, _ := strings.Cut(e2eHarnessPin(orch), "=")
+	agent = strings.TrimSuffix(agent, "-version")
+	ref, ok, err := state.Driver.ReadLabRef(context.Background(), id)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, requested, ref.Settings[agent+"-version"])
+	versions, err := readAgentVersions(config.StateDir(state.Flags.StateDir, state.RepoDir), id)
+	require.NoError(t, err)
+	require.Equal(t, requested, versions[agent].Actual)
+	require.NotEmpty(t, versions[agent].Executable)
+	var stdout, stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: []string{versions[agent].Executable, "--version"}, Stdout: &stdout, Stderr: &stderr})
+	require.NoError(t, err)
+	require.Zero(t, res.ExitCode, stderr.String())
+	require.Contains(t, stdout.String(), requested)
+	if agent == "claude-code" {
+		res, err = state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: []string{"bash", "-lc", `test "$DISABLE_AUTOUPDATER" = 1`}, Stderr: &stderr})
+		require.NoError(t, err)
+		require.Zero(t, res.ExitCode, "ordinary guest shells must suppress pinned Claude updates: %s", stderr.String())
+	}
+}
+
+// Only these public flags came from a manually completed native first run.
+// No account, OAuth, gateway, preferences or workspace trust is copied.
+func configureE2ECompletedClaudeOnboarding(t *testing.T, state *RootState, id, orch string) {
+	t.Helper()
+	if orch == "codex" {
+		return
+	}
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		repo := findRepoRoot(t)
+		cmd := exec.CommandContext(ctx, "python3", "-c", `import json, pathlib, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / 'tests/live'))
+from taxiway_live import _write_claude_onboarding
+state = json.loads((pathlib.Path(sys.argv[1]) / 'tests/fixtures/claude-onboarding.json').read_text())
+assert state.get('hasCompletedOnboarding') is True
+assert set(state) <= {'hasCompletedOnboarding', 'lastOnboardingVersion'}
+_write_claude_onboarding(sys.argv[2], state)
+		`, repo, strings.TrimPrefix(labNameFromID(id), "e2e-"+os.Getenv("TAXIWAY_CONTEXT_ID")+"-"))
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, "completed onboarding fixture: %s", redactE2EDiagnosticSecrets(string(output)))
+	}
+}
+
+// The expected digest is absent from the prompt, so terminal echo cannot pass.
+// Only the controlled upstream computes it after receiving the real CLI request.
+// native, when set, is the orchestrator's messaging command: a working
+// directory followed by the argv that receives the message as last argument.
+func runE2EInteractiveProbe(t *testing.T, state *RootState, id, socket, session string, native ...string) e2eInteractiveObservation {
+	t.Helper()
+	nonce := fmt.Sprintf("taxiway-readiness-%x", time.Now().UnixNano())
+	expected := fmt.Sprintf("%x", sha256.Sum256([]byte(nonce)))
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{
+		Argv: append([]string{"python3", "-c", `import hashlib, os, pathlib, subprocess, sys, time, urllib.request
+tmux = ['tmux'] + (['-L', sys.argv[1]] if sys.argv[1] else [])
+session, nonce, expected = sys.argv[2:5]
+native = sys.argv[5:]
+deadline = time.monotonic() + 80
+def run(*args):
+    return subprocess.check_output(tmux + list(args), text=True, timeout=5).strip()
+def native_agent_running():
+    root = int(run('display-message', '-p', '-t', session, '#{pane_pid}'))
+    parents = {}
+    for path in pathlib.Path('/proc').glob('[0-9]*/stat'):
+        try:
+            parents[int(path.parent.name)] = int(path.read_text().rsplit(')', 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+    owned = {root}
+    depths = {root: 0}
+    while True:
+        children = {pid for pid, parent in parents.items() if parent in owned} - owned
+        if not children:
+            break
+        depths.update({pid: depths[parents[pid]] + 1 for pid in children})
+        owned.update(children)
+    agent = 'codex' if session == 'codex' else 'claude'
+    for pid in sorted(owned, key=lambda pid: depths[pid], reverse=True):
+        try:
+            args = (pathlib.Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')[:2]
+            if any(agent in pathlib.Path(arg.decode()).name for arg in args if arg):
+                return pid
+        except (OSError, UnicodeError):
+            pass
+    return None
+def submit(request_nonce):
+    if native:
+        # Use the orchestrator's documented messaging API (gt nudge, gc session
+        # submit). Idle was verified above, so delivery is immediate.
+        env = dict(os.environ, PATH=str(pathlib.Path.home() / '.local/bin') + ':' + os.environ['PATH'])
+        subprocess.check_output(native[1:] + ['Reply only with the SHA256 hex digest of this nonce: ' + request_nonce],
+                                cwd=native[0], env=env, text=True, timeout=35)
+        return
+    if session != 'codex':
+        # Match Gastown v1.2.1's native SendKeys protocol: literal input and
+        # its documented 100ms debounce prevent a missed Enter after handoff.
+        run('send-keys', '-t', session, '-l', 'Reply only with the SHA256 hex digest of this nonce: ' + request_nonce)
+        time.sleep(.1)
+        run('send-keys', '-t', session, 'Enter')
+        return
+    run('set-buffer', '-b', request_nonce, 'Reply only with the SHA256 hex digest of this nonce: ' + request_nonce)
+    try:
+        run('paste-buffer', '-p', '-b', request_nonce, '-t', session)
+    finally:
+        run('delete-buffer', '-b', request_nonce)
+    run('send-keys', '-t', session, 'Enter')
+while True:
+    pane = run('display-message', '-p', '-t', session, '#{pane_dead}|#{pane_current_command}')
+    assert pane.split('|')[0] == '0', 'interactive agent exited before request'
+    capture = run('capture-pane', '-p', '-J', '-S', '-100', '-t', session)
+    blocked = ('try new model', 'use existing model', 'choose the text style',
+               'choose a theme', 'select login method', 'select the login method',
+               'do you trust the files', 'trust this folder')
+    if any(dialog in capture.lower() for dialog in blocked):
+        print(capture[-2400:], file=sys.stderr)
+        raise RuntimeError('interactive startup dialog requires manual acceptance')
+    if native_agent_running() and ('›' in capture or '❯' in capture) and 'esc to interrupt' not in capture.lower():
+        break
+    assert time.monotonic() < deadline, 'interactive agent failed to start'
+    time.sleep(.2)
+submit(nonce)
+while time.monotonic() < deadline:
+    pane = run('display-message', '-p', '-t', session, '#{pane_dead}')
+    assert pane == '0', 'interactive agent exited while handling request'
+    capture = run('capture-pane', '-p', '-J', '-S', '-100', '-t', session)
+    if expected in capture and 'esc to interrupt' not in capture.lower():
+        print('completed interactive response from controlled upstream')
+        break
+    time.sleep(.5)
+else:
+    # Fixture-only captures: bounded, no environment or credential files.
+    print(capture[-2400:], file=sys.stderr)
+    raise RuntimeError('no completed interactive response; inspect startup/dialog or gateway errors')
+if session == 'codex':
+    # A live pane and gateway are insufficient: the controlled upstream rejects
+    # this unique native request, so neither echo nor an earlier answer can pass.
+    pid = native_agent_running()
+    assert pid, 'native agent disappeared before blocked-request check'
+    proc = pathlib.Path('/proc') / str(pid)
+    env = dict(entry.split(b'=', 1) for entry in (proc / 'environ').read_bytes().split(b'\0') if b'=' in entry)
+    base = env[b'TAXIWAY_LITELLM_BASE_URL'].decode().rstrip('/')
+    assert urllib.request.urlopen(base + '/health/liveliness', timeout=5).status == 200, 'gateway must remain healthy'
+    blocked_nonce = nonce + '-blocked'
+    blocked_expected = hashlib.sha256(blocked_nonce.encode()).hexdigest()
+    submit(blocked_nonce)
+    # The native client retries rejected streams up to five times. Let it
+    # finish that bounded cycle before entering a subsequent prompt.
+    blocked_deadline = time.monotonic() + 60
+    while time.monotonic() < blocked_deadline:
+        assert run('display-message', '-p', '-t', session, '#{pane_dead}') == '0', 'blocked pane must stay alive'
+        capture = run('capture-pane', '-p', '-J', '-S', '-100', '-t', session)
+        assert blocked_expected not in capture, 'rejected request unexpectedly completed'
+        if 'fixture-request-blocked' in capture and 'esc to interrupt' not in capture.lower():
+            print('PASS rejected-native-request has no completion with live pane and gateway')
+            break
+        time.sleep(.2)
+    else:
+        print(capture[-2400:], file=sys.stderr)
+        raise RuntimeError('controlled rejection was not observed by the real client')
+    resumed_nonce = nonce + 'c'
+    resumed_expected = hashlib.sha256(resumed_nonce.encode()).hexdigest()
+    submit(resumed_nonce)
+    resumed_deadline = time.monotonic() + 30
+    while time.monotonic() < resumed_deadline:
+        capture = run('capture-pane', '-p', '-J', '-S', '-100', '-t', session)
+        if resumed_expected in capture and 'esc to interrupt' not in capture.lower():
+            print('PASS native-client completes a subsequent normal request')
+            break
+        time.sleep(.2)
+    else:
+        print(capture[-2400:], file=sys.stderr)
+        raise RuntimeError('native agent did not complete the subsequent normal request')
+`, socket, session, nonce, expected}, native...), Stdout: &stdout, Stderr: &stderr,
+	})
+	return e2eInteractiveObservation{session: session, result: res, err: err, stdout: stdout.String(), stderr: stderr.String()}
+}
+
+// Observation is separated from the native interaction so assertions never send input.
+type e2eInteractiveObservation struct {
+	session        string
+	result         driver.ExecResult
+	err            error
+	stdout, stderr string
+}
+
+func assertE2EInteractiveObservation(t *testing.T, observation e2eInteractiveObservation, expectBlocked bool) {
+	t.Helper()
+	session, res, err := observation.session, observation.result, observation.err
+	stdout, stderr := observation.stdout, observation.stderr
+	require.NoError(t, err, "interactive session %s: %s", session, redactE2EDiagnosticSecrets(stderr))
+	if expectBlocked {
+		require.NotZero(t, res.ExitCode, "first-run dialog must reject readiness")
+		require.Contains(t, stderr, "interactive startup dialog requires manual acceptance")
+		return
+	}
+	require.Zero(t, res.ExitCode, "interactive session %s: %s", session, redactE2EDiagnosticSecrets(stderr))
+	require.Contains(t, stdout, "completed interactive response")
+	t.Log(strings.TrimSpace(stdout))
 }
 
 func assertE2EShellCheck(t *testing.T, root *cobra.Command, tb *dockerTestBuf, lab, orch string) {
@@ -702,9 +1713,220 @@ func assertE2EShellCheck(t *testing.T, root *cobra.Command, tb *dockerTestBuf, l
 	require.Contains(t, out, orch)
 }
 
+func assertE2EClaudeCodeSession(t *testing.T, state *RootState, id string) {
+	t.Helper()
+	assertE2EClaudeEnvironment(t, state, id, "", "claude-code")
+}
+
+// Inspect the actual Claude process, not the tmux server or its launching shell.
+// Shared by standalone sessions, Gastown/Gas City roles, and their handoffs.
+func assertE2EClaudeEnvironment(t *testing.T, state *RootState, id, socket, session string) {
+	t.Helper()
+	ref, ok, err := state.Driver.ReadLabRef(context.Background(), id)
+	require.NoError(t, err)
+	require.True(t, ok)
+	expected, err := json.Marshal(map[string]any{
+		"model":           e2eExpectations(t, ref.Orch).model,
+		"harness_version": ref.Settings["claude-code-version"],
+		"models":          e2eGatewayModelNames(t, ref.Orch),
+		"aliases":         e2eClaudeModelAliases(t),
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	var stderr bytes.Buffer
+	res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{
+		Argv: []string{"python3", "-c", `import json, pathlib, subprocess, sys, time
+tmux = ['tmux'] + (['-L', sys.argv[1]] if sys.argv[1] else [])
+deadline = time.monotonic() + 30
+while True:
+    pane = subprocess.check_output(tmux + ['display-message', '-p', '-t', sys.argv[2],
+        '#{pane_pid}|#{pane_dead}|#{pane_current_command}'], text=True).strip().split('|')
+    assert len(pane) == 3 and pane[1] == '0', 'Claude pane must be alive'
+    if pane[2] in ('claude', 'node'):
+        break
+    assert time.monotonic() < deadline, 'pane did not start Claude'
+    time.sleep(0.2)
+args = (pathlib.Path('/proc') / pane[0] / 'cmdline').read_bytes().split(b'\0')
+assert b'--dangerously-skip-permissions' in args, 'Claude lost autonomous permission contract'
+if sys.argv[4] == 'file':
+    # Gas City writes the setting to a --settings file it owns.
+    settings = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == b'--settings']
+    assert any(json.loads(pathlib.Path(value.decode()).read_text()).get('skipDangerousModePermissionPrompt') is True
+               for value in settings), 'Claude must skip the bypass startup warning'
+else:
+    assert b'{"skipDangerousModePermissionPrompt":true}' in args, 'Claude must skip the bypass startup warning'
+env = dict(entry.split(b'=', 1) for entry in (pathlib.Path('/proc') / pane[0] / 'environ').read_bytes().split(b'\0') if b'=' in entry)
+assert env.get(b'ENABLE_TOOL_SEARCH') == b'true', 'Claude lost tool search default'
+assert env.get(b'ENABLE_CLAUDEAI_MCP_SERVERS') == b'false', 'Claude must disable connector import by default'
+expected = json.loads(sys.argv[3])
+if expected.get('harness_version') not in ('', None, 'latest'):
+    assert env.get(b'DISABLE_AUTOUPDATER') == b'1', 'pinned Claude process lost update suppression'
+args = (pathlib.Path('/proc') / pane[0] / 'cmdline').read_bytes().split(b'\0')
+assert b'--model' in args, 'Claude lost explicit model argument'
+assert args[args.index(b'--model')+1].decode() == expected['model'], 'Claude changed principal model'
+for alias, model in expected['aliases'].items():
+    key = ('ANTHROPIC_DEFAULT_'+alias.upper()+'_MODEL').encode()
+    assert env.get(key) == model.encode(), 'Claude lost '+alias+' alias'
+models = json.loads(env.get(b'TAXIWAY_CLAUDE_AVAILABLE_MODELS', b'null'))
+assert isinstance(models, list) and sorted(models) == sorted(expected['models']), 'Claude process lost provider model catalog'
+policy = json.loads(pathlib.Path('/etc/claude-code/managed-settings.json').read_text())
+assert sorted(policy['availableModels']) == sorted(expected['models']), 'Claude managed model catalog differs from gateway'
+assert policy['enforceAvailableModels'] is True, 'Claude model policy is not enforced'
+assert policy['availableModelsMatch'] == 'exact', 'Claude model policy must match exact IDs'
+`, socket, session, string(expected), map[bool]string{true: "file", false: "inline"}[e2eExpectations(t, ref.Orch).settingsFile]},
+		Stderr: &stderr,
+	})
+	require.NoError(t, err, "Claude model/MCP environment in %s: %s", session, stderr.String())
+	require.Equal(t, 0, res.ExitCode, "Claude model/MCP environment in %s: %s", session, stderr.String())
+}
+
+// Read the catalog from the tested source tree, not the generated lab config.
+// This keeps expectations independent of the gateway's selection/rendering code.
+func e2eSourceModelCatalog(t *testing.T) modelcatalog.Catalog {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(findRepoRoot(t), "infra", "gateway", "litellm", "models.yaml"))
+	require.NoError(t, err)
+	catalog, err := modelcatalog.Parse(data)
+	require.NoError(t, err)
+	return catalog
+}
+
+func e2eModelProvider(orch string) string {
+	if orch == "codex" {
+		return "chatgpt"
+	}
+	return "anthropic"
+}
+
+// Subtests retain their parent scenario name. Prepare/run covers manifest
+// defaults; up and phase-by-phase cover explicit deprecated selections.
+func e2eUsesManifestDefault(t *testing.T) bool {
+	return strings.HasSuffix(strings.SplitN(t.Name(), "/", 2)[0], "_PrepareRun")
+}
+
+func e2ePrincipalModel(t *testing.T, orch string) string {
+	t.Helper()
+	manifest, err := config.LoadOrchManifest(findRepoRoot(t), orch)
+	require.NoError(t, err)
+	require.NotNil(t, manifest)
+	var defaultModel string
+	for _, setting := range manifest.Settings {
+		if setting.Name == "model" {
+			defaultModel = setting.Default
+		}
+	}
+	require.NotEmpty(t, defaultModel, "orchestrator must declare its default model")
+	catalog := e2eSourceModelCatalog(t)
+	foundDefault := false
+	var alternative string
+	aliases := catalog.Defaults[e2eModelProvider(orch)]
+	for _, model := range catalog.Models {
+		if model.Provider != e2eModelProvider(orch) {
+			continue
+		}
+		if model.Name == defaultModel {
+			require.NotEqual(t, "retired", model.StatusAt(modelNow()), "shipped default must remain usable")
+			foundDefault = true
+		} else if (alternative == "" || model.Name < alternative) && model.StatusAt(modelNow()) == "active" {
+			isAlias := false
+			for _, name := range aliases {
+				isAlias = isAlias || model.Name == name
+			}
+			if isAlias {
+				continue
+			}
+			alternative = model.Name
+		}
+	}
+	require.True(t, foundDefault, "shipped default must be in the provider catalog")
+	if e2eUsesManifestDefault(t) {
+		return defaultModel
+	}
+	require.NotEmpty(t, alternative, "need a provider-compatible alternative to prove explicit selection")
+	return alternative
+}
+
+func e2eClaudeModelAliases(t *testing.T) map[string]string {
+	t.Helper()
+	aliases := e2eSourceModelCatalog(t).Defaults["anthropic"]
+	for _, alias := range []string{"opus", "sonnet", "haiku"} {
+		require.NotEmpty(t, aliases[alias], "Claude tier alias %s must be defined", alias)
+	}
+	return aliases
+}
+
+func e2eGatewayModelNames(t *testing.T, orch string) []string {
+	t.Helper()
+	catalog := e2eSourceModelCatalog(t)
+	names := []string{e2ePrincipalModel(t, orch)}
+	aliases := catalog.Defaults[e2eModelProvider(orch)]
+	for _, model := range catalog.Models {
+		if model.Provider != e2eModelProvider(orch) || model.Name == names[0] {
+			continue
+		}
+		include := model.StatusAt(modelNow()) == "active"
+		for _, name := range aliases {
+			include = include || model.Name == name
+		}
+		if include {
+			names = append(names, model.Name)
+		}
+	}
+	require.Greater(t, len(names), 1, "gateway must expose models beyond the principal")
+	return names
+}
+
+func assertE2ECodexModel(t *testing.T, state *RootState, id string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	var stderr bytes.Buffer
+	res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{
+		Argv: []string{"python3", "-c", `import os, pathlib, subprocess, sys, time, tomllib
+assert (pathlib.Path('/proc/self/task')/str(os.getpid())/'children').exists(), 'Codex process inspection requires Linux CONFIG_PROC_CHILDREN'
+config = tomllib.loads((pathlib.Path.home()/'.codex/config.toml').read_text())
+assert config['model'] == sys.argv[1], 'Codex changed principal model'
+assert config['model_provider'] == 'taxiway-litellm', 'Codex bypassed gateway provider'
+provider = config['model_providers']['taxiway-litellm']
+assert provider['wire_api'] == 'responses', 'Codex must use Responses API'
+assert provider['requires_openai_auth'] is False, 'Codex lab must not carry provider auth'
+deadline = time.monotonic()+30
+while True:
+    pane = subprocess.check_output(['tmux','display-message','-p','-t','codex','#{pane_pid}|#{pane_dead}'], text=True).strip().split('|')
+    assert len(pane) == 2 and pane[1] == '0', 'Codex pane must be alive'
+    candidates = [int(pane[0])]
+    for pid in candidates:
+        proc = pathlib.Path('/proc')/str(pid)
+        try:
+            args = (proc/'cmdline').read_bytes().split(b'\0')
+        except FileNotFoundError:
+            continue
+        if any(pathlib.PurePath(a.decode(errors='replace')).name == 'codex' for a in args):
+            try:
+                env = dict(e.split(b'=',1) for e in (proc/'environ').read_bytes().split(b'\0') if b'=' in e)
+            except FileNotFoundError:
+                continue
+            assert provider['base_url'] == env[b'TAXIWAY_LITELLM_BASE_URL'].decode().rstrip('/')+'/v1', 'Codex process lost gateway URL'
+            assert env.get(b'TAXIWAY_LITELLM_API_KEY'), 'Codex process lost gateway key'
+            sys.exit(0)
+        children = proc/'task'/str(pid)/'children'
+        try:
+            candidates.extend(map(int, children.read_text().split()))
+        except FileNotFoundError:
+            pass
+    assert time.monotonic() < deadline, 'Codex process did not start'
+    time.sleep(0.2)
+`, e2eExpectations(t, "codex").model},
+		Stderr: &stderr,
+	})
+	require.NoError(t, err, "Codex process inspection: %s", stderr.String())
+	require.Equal(t, 0, res.ExitCode, "Codex model configuration: %s", stderr.String())
+}
+
 func assertE2EGastownSessions(t *testing.T, state *RootState, id string) {
 	t.Helper()
-	runE2EAssert(t, "assert:orchestrator-present-sessions-healthy", func(t *testing.T) {
+	{
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		run := func(allowCheckFailure bool, argv ...string) string {
@@ -770,6 +1992,8 @@ func assertE2EGastownSessions(t *testing.T, state *RootState, id string) {
 		for _, session := range sessions {
 			present[session] = true
 		}
+		require.True(t, present["hq-mayor"], "persistent Mayor session must exist")
+		require.True(t, present["hq-deacon"], "persistent Deacon session must exist")
 		checked := 0
 		for _, agent := range agents {
 			// Boot/dogs can finish normally; absent idle agents are not required.
@@ -778,18 +2002,104 @@ func assertE2EGastownSessions(t *testing.T, state *RootState, id string) {
 			}
 			checked++
 			require.True(t, agent.Running, "Present session %s is not recognized as running by Gastown", agent.Session)
+			assertE2EClaudeEnvironment(t, state, id, status.Tmux.Socket, agent.Session)
+			workspace := strings.TrimSpace(run(false, "tmux", "-L", status.Tmux.Socket,
+				"display-message", "-p", "-t", agent.Session, "#{pane_current_path}"))
+			assertE2EAgentWorkspaceTrusted(t, state, id, "claude-code", workspace)
 		}
 		require.Positive(t, checked, "No persistent agent session was checked")
+	}
+}
+
+func runE2EGastownReadinessActions(t *testing.T, state *RootState, id, stage string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	run := func(t *testing.T, _ bool, argv ...string) string {
+		var stdout, stderr bytes.Buffer
+		command := append([]string{"bash", "-c", `export PATH="$HOME/.local/bin:$PATH"; exec "$@"`, "gastown-e2e"}, argv...)
+		res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{Workdir: "/lab/work/gt", Argv: command, Stdout: &stdout, Stderr: &stderr})
+		require.NoError(t, err)
+		require.Zero(t, res.ExitCode, "%v: %s", argv, redactE2EDiagnosticSecrets(stderr.String()))
+		return stdout.String()
+	}
+	type agentStatus struct {
+		Session string `json:"session"`
+		Role    string `json:"role"`
+	}
+	var status struct {
+		Agents []agentStatus `json:"agents"`
+		Rigs   []struct {
+			Agents []agentStatus `json:"agents"`
+		} `json:"rigs"`
+		Tmux struct {
+			Socket string `json:"socket"`
+		} `json:"tmux"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(run(t, false, "gt", "status", "--json")), &status))
+	present := map[string]bool{}
+	for _, session := range strings.Fields(run(t, false, "tmux", "-L", status.Tmux.Socket, "list-sessions", "-F", "#{session_name}")) {
+		present[session] = true
+	}
+	agents := status.Agents
+	for _, rig := range status.Rigs {
+		agents = append(agents, rig.Agents...)
+	}
+	for _, agent := range agents {
+		if !present[agent.Session] || agent.Role == "boot" || agent.Role == "dog" {
+			continue
+		}
+		runE2EStep(t, "agent:send[controlled-readiness-probe,"+agent.Session+"]@"+stage, func(t *testing.T) {
+			// Gastown v1.2.1 documents gt nudge as its native messaging API.
+			// Custom agent presets have no wait-idle prompt detector, so use
+			// documented direct delivery instead of queueing.
+			observation := runE2EInteractiveProbe(t, state, id, status.Tmux.Socket, agent.Session, e2eGastownNudge(agent.Session)...)
+			runE2EAssert(t, "assert:interactive-response-completed", func(t *testing.T) {
+				assertE2EInteractiveObservation(t, observation, false)
+			})
+		})
+	}
+
+	var newSession string
+	runE2EStep(t, "gt:crew[add,start,fresh-workspace]@"+stage, func(t *testing.T) {
+
+		// Exercise the adapter's normal launcher in a directory created after
+		// startup. Trust at install time cannot accidentally satisfy this case.
+		crew := fmt.Sprintf("readiness%x", time.Now().UnixNano())
+		run(t, false, "gt", "crew", "add", crew, "--rig", "e2e_fixture")
+		run(t, false, "gt", "crew", "start", "e2e_fixture", crew)
+		newSessions := strings.Fields(run(t, false, "tmux", "-L", status.Tmux.Socket, "list-sessions", "-F", "#{session_name}"))
+		for _, session := range newSessions {
+			if strings.HasSuffix(session, "-crew-"+crew) {
+				newSession = session
+				break
+			}
+		}
+		runE2EAssert(t, "assert:fresh-crew-configured-and-trusted", func(t *testing.T) {
+			require.NotEmpty(t, newSession, "new crew must start an actual agent session")
+			assertE2EClaudeEnvironment(t, state, id, status.Tmux.Socket, newSession)
+			assertE2EAgentWorkspaceTrusted(t, state, id, "claude-code", "/lab/work/gt/e2e_fixture/crew/"+crew)
+		})
 	})
+	runE2EStep(t, "agent:send[fresh-crew-readiness-probe]@"+stage, func(t *testing.T) {
+		observation := runE2EInteractiveProbe(t, state, id, status.Tmux.Socket, newSession, e2eGastownNudge(newSession)...)
+		runE2EAssert(t, "assert:interactive-response-completed", func(t *testing.T) {
+			assertE2EInteractiveObservation(t, observation, false)
+		})
+	})
+}
+
+func e2eGastownNudge(session string) []string {
+	return []string{"/lab/work/gt", "gt", "nudge", session, "--mode=immediate", "--message"}
 }
 
 // Exercise Gastown's real respawn path, not a Lab down/up. The command is
 // directed at a session without attaching a client or asking Claude to act.
-func assertE2EGastownHandoff(t *testing.T, state *RootState, id string) {
+func runE2EGastownHandoff(t *testing.T, state *RootState, id string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
-	run := func(argv ...string) string {
+	run := func(t *testing.T, argv ...string) string {
 		var stdout, stderr bytes.Buffer
 		command := append([]string{"bash", "-c", `export PATH="$HOME/.local/bin:$PATH"; exec "$@"`, "gastown-e2e"}, argv...)
 		res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{
@@ -804,38 +2114,54 @@ func assertE2EGastownHandoff(t *testing.T, state *RootState, id string) {
 			Socket string `json:"socket"`
 		} `json:"tmux"`
 	}
-	require.NoError(t, json.Unmarshal([]byte(run("gt", "status", "--json")), &status))
+	require.NoError(t, json.Unmarshal([]byte(run(t, "gt", "status", "--json")), &status))
 	require.NotEmpty(t, status.Tmux.Socket)
+	// Exercise the installed CLI from Deacon's own pane context. A named
+	// self-target must hook work without injecting a notification into Claude.
+	runE2EStep(t, "gt:sling[mol-deacon-patrol,deacon]", func(t *testing.T) {
+		deaconPane := run(t, "tmux", "-L", status.Tmux.Socket, "display-message", "-p", "-t", "hq-deacon", "#{pane_id}")
+		sling := run(t, "env", "GT_ROLE=deacon", "TMUX_PANE="+deaconPane,
+			"gt", "sling", "mol-deacon-patrol", "deacon")
+		runE2EAssert(t, "assert:self-sling-hooked-without-notification", func(t *testing.T) {
+			require.Contains(t, sling, "Self-sling: work hooked, will process on next turn")
+			// Resolve hook status from the target's workspace so phase-by-phase labs
+			// query the same Beads database that sling used for the town-level role.
+			hook := run(t, "bash", "-c", "cd /lab/work/gt/deacon && gt hook status --json")
+			require.Contains(t, hook, "mol-deacon-patrol", "self-sling must attach real patrol work")
+		})
+	})
 	// Initiate from Mayor (no patrol cooldown): repeat remote refinery handoff,
 	// then exercise Mayor's self-handoff through the same restart builder.
-	for _, target := range []string{"ah-refinery", "ah-refinery", "hq-mayor"} {
-		before := run("tmux", "-L", status.Tmux.Socket, "display-message", "-p", "-t", target, "#{pane_pid}")
-		role := "agreement_hub/refinery"
-		if target == "hq-mayor" {
-			role = "mayor"
-		}
-		// Handoff requires a tmux caller context. run-shell supplies TMUX but
-		// not TMUX_PANE; expand the target pane ID explicitly. No client attach.
-		run("tmux", "-L", status.Tmux.Socket, "run-shell", "-b", "-t", "hq-mayor",
-			`cd /lab/work/gt && export PATH="$HOME/.local/bin:$PATH" GT_ROLE=mayor TMUX_PANE='#{pane_id}'; gt handoff `+role+` --watch=false --yes --no-git-check`)
-		deadline := time.Now().Add(45 * time.Second)
-		var pane string
-		for time.Now().Before(deadline) {
-			pane = run("tmux", "-L", status.Tmux.Socket, "display-message", "-p", "-t", target,
-				"#{pane_pid}|#{pane_dead}|#{pane_current_command}")
-			parts := strings.Split(pane, "|")
-			if len(parts) == 3 && parts[0] != before && parts[1] == "0" && (parts[2] == "claude" || parts[2] == "node") {
-				break
+	for attempt, target := range []string{"ef-refinery", "ef-refinery", "hq-mayor"} {
+		runE2EStep(t, fmt.Sprintf("gt:handoff[%s,attempt=%d]", target, attempt+1), func(t *testing.T) {
+			before := run(t, "tmux", "-L", status.Tmux.Socket, "display-message", "-p", "-t", target, "#{pane_pid}")
+			role := "e2e_fixture/refinery"
+			if target == "hq-mayor" {
+				role = "mayor"
 			}
-			time.Sleep(time.Second)
-		}
-		parts := strings.Split(pane, "|")
-		require.Len(t, parts, 3, "handoff %s: %s", target, pane)
-		require.NotEqual(t, before, parts[0], "handoff must replace %s", target)
-		require.Equal(t, "0", parts[1], "replacement %s must be alive", target)
-		require.Contains(t, []string{"claude", "node"}, parts[2], "replacement %s must execute Claude", target)
-		// Compare in the guest without printing credentials in test output.
-		run("python3", "-c", `import json, pathlib, sys
+			// Handoff requires a tmux caller context. run-shell supplies TMUX but
+			// not TMUX_PANE; expand the target pane ID explicitly. No client attach.
+			run(t, "tmux", "-L", status.Tmux.Socket, "run-shell", "-b", "-t", "hq-mayor",
+				`cd /lab/work/gt && export PATH="$HOME/.local/bin:$PATH" GT_ROLE=mayor TMUX_PANE='#{pane_id}'; gt handoff `+role+` --watch=false --yes --no-git-check`)
+			deadline := time.Now().Add(45 * time.Second)
+			var pane string
+			for time.Now().Before(deadline) {
+				pane = run(t, "tmux", "-L", status.Tmux.Socket, "display-message", "-p", "-t", target,
+					"#{pane_pid}|#{pane_dead}|#{pane_current_command}")
+				parts := strings.Split(pane, "|")
+				if len(parts) == 3 && parts[0] != before && parts[1] == "0" && (parts[2] == "claude" || parts[2] == "node") {
+					break
+				}
+				time.Sleep(time.Second)
+			}
+			runE2EAssert(t, "assert:replacement-process-model-and-gateway-preserved", func(t *testing.T) {
+				parts := strings.Split(pane, "|")
+				require.Len(t, parts, 3, "handoff %s: %s", target, pane)
+				require.NotEqual(t, before, parts[0], "handoff must replace %s", target)
+				require.Equal(t, "0", parts[1], "replacement %s must be alive", target)
+				require.Contains(t, []string{"claude", "node"}, parts[2], "replacement %s must execute Claude", target)
+				// Compare in the guest without printing credentials in test output.
+				run(t, "python3", "-c", `import json, pathlib, sys
 p = pathlib.Path('/proc') / sys.argv[1]
 env = dict(entry.split(b'=', 1) for entry in (p / 'environ').read_bytes().split(b'\0') if b'=' in entry)
 agent = json.loads(pathlib.Path('/lab/work/gt/settings/agents.json').read_text())['agents']['claude-code-litellm']
@@ -845,15 +2171,347 @@ args = (p / 'cmdline').read_bytes().split(b'\0')
 assert b'--model' in args, 'handoff lost model selection'
 assert args[args.index(b'--model') + 1] == sys.argv[2].encode(), 'handoff changed model'
 `, parts[0], e2eExpectations(t, "gastown").model)
+				assertE2EClaudeEnvironment(t, state, id, status.Tmux.Socket, target)
+				if target == "hq-mayor" {
+					assertE2EGastownSessions(t, state, id)
+				}
+			})
+		})
 	}
-	assertE2EGastownSessions(t, state, id)
+}
+
+// Docker labs are container guests: an init reaps orphans as PID 1 and no
+// systemd user manager is faked. The guest kind phase scripts receive is
+// observed through the bootstrap preview (`Guest environment: container`).
+func assertE2EContainerGuest(t *testing.T, state *RootState, id string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: []string{"bash", "-c", `set -u
+test "$(cat /proc/1/comm)" = docker-init || { echo "PID 1 is $(cat /proc/1/comm)" >&2; exit 1; }
+if out=$(systemctl --user show-environment 2>/dev/null); then echo "systemctl --user pretends a user manager exists" >&2; exit 1; fi
+test -z "$out" || { echo "systemctl --user wrote to stdout" >&2; exit 1; }`}, Stdout: &stdout, Stderr: &stderr})
+	require.NoError(t, err)
+	require.Zero(t, res.ExitCode, "container guest contract: %s", stderr.String())
+}
+
+// In a container guest, Gas City's supervisor is the detached canonical loop
+// reparented to the init, no systemd unit is installed, and no orphan (a
+// process reparented to the init) is left as a zombie after the city's
+// stop/start cycles. Zombies of live parents are their parents' to reap.
+func assertE2EGascityContainerSupervisor(t *testing.T, state *RootState, id string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	runE2EGascity(t, ctx, state, id, "python3", "-c", `import pathlib, time
+def processes():
+    rows = []
+    for stat in pathlib.Path('/proc').glob('[0-9]*/stat'):
+        try:
+            fields = stat.read_text().rsplit(')', 1)[1].split()
+            args = (stat.parent / 'cmdline').read_bytes().split(b'\0')
+        except OSError:
+            continue
+        rows.append((int(stat.parent.name), int(fields[1]), fields[0], [a.decode(errors='replace') for a in args if a]))
+    return rows
+supervisors = [(pid, ppid) for pid, ppid, state, args in processes()
+               if args[1:3] == ['supervisor', 'run'] and args[0].endswith('/gc')]
+assert len(supervisors) == 1, 'expected one gc supervisor run process, got %s' % supervisors
+assert supervisors[0][1] == 1, 'supervisor must be detached under the init, parent %d' % supervisors[0][1]
+for unit_dir in ('.local/share/systemd/user', '.config/systemd/user'):
+    units = list((pathlib.Path.home() / unit_dir).glob('gascity*'))
+    assert not units, 'container guest must not install a Gas City unit: %s' % units
+deadline = time.monotonic() + 5
+while True:
+    orphans = [pid for pid, ppid, state, args in processes() if state == 'Z' and ppid == 1]
+    if not orphans:
+        break
+    assert time.monotonic() < deadline, 'the init left orphan zombies: %s' % orphans
+    time.sleep(0.5)
+`)
+}
+
+// After reset, the stop hook left no Gas City supervisor or deferred-nudge
+// poller running in the guest.
+func assertE2EGascityStopped(t *testing.T, state *RootState, id string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: []string{"bash", "-c",
+		`pgrep -f '^[^ ]*gc (supervisor run|nudge poll)' && exit 1 || exit 0`}, Stdout: &stdout, Stderr: &stderr})
+	require.NoError(t, err)
+	require.Zero(t, res.ExitCode, "Gas City processes still running after reset: %s", stdout.String())
+}
+
+// Gas City names its tmux socket after the city directory (/lab/work/gc).
+const (
+	e2eGascityCityDir = "/lab/work/gc"
+	e2eGascitySocket  = "gc"
+	e2eGascityRepo    = "/lab/work/e2e-fixture"
+)
+
+type e2eGascitySession struct {
+	ID          string `json:"id"`
+	Template    string `json:"template"`
+	State       string `json:"state"`
+	SessionName string `json:"session_name"`
+	WorkDir     string `json:"work_dir"`
+}
+
+func runE2EGascity(t *testing.T, ctx context.Context, state *RootState, id string, argv ...string) string {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	// Docker Exec does not load a shell profile: match the adapter's PATH.
+	command := append([]string{"bash", "-c", `export PATH="$HOME/.local/bin:$PATH"; exec "$@"`, "gascity-e2e"}, argv...)
+	res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{Workdir: e2eGascityCityDir, Argv: command, Stdout: &stdout, Stderr: &stderr})
+	require.NoError(t, err, "%v", argv)
+	require.Zero(t, res.ExitCode, "%v: %s", argv, redactE2EDiagnosticSecrets(stderr.String()))
+	return stdout.String()
+}
+
+// Active agent sessions with a live pane. Boot and dogs finish normally, so
+// only persistent roles and explicitly created sessions are returned.
+func e2eGascityAgentSessions(t *testing.T, ctx context.Context, state *RootState, id string) []e2eGascitySession {
+	t.Helper()
+	var list struct {
+		Sessions []e2eGascitySession `json:"sessions"`
+	}
+	output := runE2EGascity(t, ctx, state, id, "gc", "session", "list", "--json")
+	require.NoError(t, json.Unmarshal([]byte(output), &list), "gc session list: %s", output)
+	present := map[string]bool{}
+	for _, name := range strings.Fields(runE2EGascity(t, ctx, state, id, "tmux", "-L", e2eGascitySocket, "list-sessions", "-F", "#{session_name}")) {
+		present[name] = true
+	}
+	var sessions []e2eGascitySession
+	for _, session := range list.Sessions {
+		if session.State != "active" || !present[session.SessionName] ||
+			strings.HasSuffix(session.Template, ".boot") || strings.HasSuffix(session.Template, ".dog") {
+			continue
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions
+}
+
+// The Taxiway-managed configuration routes every session through the lab
+// gateway with the selected effort: compare the Claude process with the
+// managed Lab configuration in the guest, without printing credentials.
+func assertE2EGascityLaunch(t *testing.T, state *RootState, id, session string) {
+	t.Helper()
+	ref, ok, err := state.Driver.ReadLabRef(context.Background(), id)
+	require.NoError(t, err)
+	require.True(t, ok)
+	effort := ref.Settings["effort"]
+	if effort == "" {
+		effort = "max" // Manifest default, Gas City's own default.
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	runE2EGascity(t, ctx, state, id, "python3", "-c", `import pathlib, shlex, subprocess, sys, tomllib
+pid = subprocess.check_output(['tmux', '-L', sys.argv[1], 'display-message', '-p', '-t', sys.argv[2], '#{pane_pid}'], text=True).strip()
+env = dict(e.split(b'=', 1) for e in (pathlib.Path('/proc') / pid / 'environ').read_bytes().split(b'\0') if b'=' in e)
+lab = {}
+for line in (pathlib.Path.home() / '.config/taxiway/env').read_text().splitlines():
+    if '=' in line and not line.lstrip().startswith('#'):
+        key, value = line.split('=', 1)
+        lab[key.strip()] = ''.join(shlex.split(value))
+key = lab['TAXIWAY_LITELLM_API_KEY']
+assert env.get(b'ANTHROPIC_BASE_URL', b'').decode() == lab['TAXIWAY_LITELLM_BASE_URL'].rstrip('/'), 'session bypasses the lab gateway'
+assert env.get(b'ANTHROPIC_CUSTOM_HEADERS', b'').decode() == 'x-litellm-api-key: Bearer ' + key, 'session lost the gateway key header'
+assert env.get(b'ANTHROPIC_AUTH_TOKEN', b'').decode() == key, 'api-key mode must authenticate Claude with the gateway key'
+city = tomllib.loads(pathlib.Path(sys.argv[3], 'city.toml').read_text())
+assert city.get('include', []).count('taxiway.toml') == 1, 'city.toml must include the managed fragment once'
+fragment = pathlib.Path(sys.argv[3], 'taxiway.toml')
+assert fragment.stat().st_mode & 0o077 == 0, 'managed fragment must be private'
+assert key not in fragment.read_text(), 'managed fragment must reference, not inline, the gateway key'
+args = (pathlib.Path('/proc') / pid / 'cmdline').read_bytes().split(b'\0')
+efforts = [args[i + 1].decode() for i, arg in enumerate(args[:-1]) if arg == b'--effort']
+assert efforts == [sys.argv[4]], 'session must run with the selected effort, got %s' % efforts
+`, e2eGascitySocket, session, e2eGascityCityDir, effort)
+}
+
+func assertE2EGascitySessions(t *testing.T, state *RootState, id string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	// Persistent roles restart fresh after each drain, so one can be briefly
+	// relaunching: require each to be active within a bounded wait.
+	roles := []string{"gastown.mayor", "gastown.deacon", "e2e-fixture/gastown.witness"}
+	var sessions []e2eGascitySession
+	var missing []string
+	for deadline := time.Now().Add(2 * time.Minute); ; time.Sleep(3 * time.Second) {
+		sessions = e2eGascityAgentSessions(t, ctx, state, id)
+		templates := map[string]bool{}
+		for _, session := range sessions {
+			templates[session.Template] = true
+		}
+		missing = nil
+		for _, role := range roles {
+			if !templates[role] {
+				missing = append(missing, role)
+			}
+		}
+		if len(missing) == 0 || time.Now().After(deadline) {
+			break
+		}
+	}
+	require.Empty(t, missing, "persistent sessions must be active: %s",
+		runE2EGascity(t, ctx, state, id, "gc", "session", "list"))
+	for _, session := range sessions {
+		assertE2EClaudeEnvironment(t, state, id, e2eGascitySocket, session.SessionName)
+		assertE2EGascityLaunch(t, state, id, session.SessionName)
+		// Agents run under the trusted city (.gc/agents/*) or the trusted rig.
+		require.True(t, strings.HasPrefix(session.WorkDir, e2eGascityCityDir+"/") || session.WorkDir == e2eGascityRepo,
+			"session %s works outside the trusted roots: %s", session.SessionName, session.WorkDir)
+	}
+	assertE2EAgentWorkspaceTrusted(t, state, id, "claude-code", e2eGascityCityDir)
+	assertE2EAgentWorkspaceTrusted(t, state, id, "claude-code", e2eGascityRepo)
+}
+
+// waitE2EGascityActive waits until Gas City reports the session active again;
+// a relaunched pane can run Claude before the controller records it.
+func waitE2EGascityActive(t *testing.T, ctx context.Context, state *RootState, id, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Minute)
+	var current string
+	for time.Now().Before(deadline) {
+		var list struct {
+			Sessions []e2eGascitySession `json:"sessions"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(runE2EGascity(t, ctx, state, id, "gc", "session", "list", "--json")), &list))
+		for _, session := range list.Sessions {
+			if session.ID == sessionID {
+				current = session.State
+			}
+		}
+		if current == "active" {
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	require.FailNowf(t, "session did not become active", "%s: %s", sessionID, current)
+}
+
+// waitE2EGascityClaude waits for a session pane to run a replacement Claude.
+func waitE2EGascityClaude(t *testing.T, ctx context.Context, state *RootState, id, session, previousPID string) string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Minute)
+	var pane string
+	for time.Now().Before(deadline) {
+		var stdout bytes.Buffer
+		res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{Argv: []string{"tmux", "-L", e2eGascitySocket,
+			"display-message", "-p", "-t", session, "#{pane_pid}|#{pane_dead}|#{pane_current_command}"}, Stdout: &stdout})
+		require.NoError(t, err)
+		pane = strings.TrimSpace(stdout.String())
+		parts := strings.Split(pane, "|")
+		if res.ExitCode == 0 && len(parts) == 3 && parts[0] != previousPID && parts[1] == "0" && (parts[2] == "claude" || parts[2] == "node") {
+			return parts[0]
+		}
+		time.Sleep(2 * time.Second)
+	}
+	require.FailNowf(t, "session did not run Claude", "%s: %s", session, pane)
+	return ""
+}
+
+func runE2EGascityReadinessActions(t *testing.T, state *RootState, id, stage string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	for _, session := range e2eGascityAgentSessions(t, ctx, state, id) {
+		runE2EStep(t, "agent:send[controlled-readiness-probe,"+session.SessionName+"]@"+stage, func(t *testing.T) {
+			// gc session submit is Gas City's native messaging API.
+			observation := runE2EInteractiveProbe(t, state, id, e2eGascitySocket, session.SessionName,
+				e2eGascityCityDir, "gc", "session", "submit", session.ID)
+			runE2EAssert(t, "assert:interactive-response-completed", func(t *testing.T) {
+				assertE2EInteractiveObservation(t, observation, false)
+			})
+		})
+	}
+
+	var fresh struct {
+		SessionID   string `json:"session_id"`
+		SessionName string `json:"session_name"`
+		WorkDir     string `json:"work_dir"`
+	}
+	runE2EStep(t, "gc:session[new,fresh-workspace]@"+stage, func(t *testing.T) {
+		// A session created after startup proves that configuration and trust
+		// apply to every launch, not only to the sessions start observed.
+		alias := fmt.Sprintf("readiness%x", time.Now().UnixNano())
+		output := runE2EGascity(t, ctx, state, id, "gc", "session", "new", "e2e-fixture/claude", "--alias", alias, "--no-attach", "--json")
+		require.NoError(t, json.Unmarshal([]byte(output), &fresh), "gc session new: %s", output)
+		waitE2EGascityClaude(t, ctx, state, id, fresh.SessionName, "")
+		waitE2EGascityActive(t, ctx, state, id, fresh.SessionID)
+		runE2EAssert(t, "assert:fresh-session-configured-and-trusted", func(t *testing.T) {
+			require.Equal(t, e2eGascityRepo, fresh.WorkDir)
+			assertE2EClaudeEnvironment(t, state, id, e2eGascitySocket, fresh.SessionName)
+			assertE2EGascityLaunch(t, state, id, fresh.SessionName)
+			assertE2EAgentWorkspaceTrusted(t, state, id, "claude-code", fresh.WorkDir)
+		})
+	})
+	runE2EStep(t, "agent:send[fresh-session-readiness-probe]@"+stage, func(t *testing.T) {
+		observation := runE2EInteractiveProbe(t, state, id, e2eGascitySocket, fresh.SessionName,
+			e2eGascityCityDir, "gc", "session", "submit", fresh.SessionID)
+		runE2EAssert(t, "assert:interactive-response-completed", func(t *testing.T) {
+			assertE2EInteractiveObservation(t, observation, false)
+		})
+	})
+	runE2EStep(t, "gc:session[close,fresh-workspace]@"+stage, func(t *testing.T) {
+		runE2EGascity(t, ctx, state, id, "gc", "session", "close", fresh.SessionID)
+	})
+}
+
+// Exercise Gas City's native fresh restart of persistent roles, not a Lab
+// down/up: the controller relaunches them from the same configuration.
+func runE2EGascityHandoff(t *testing.T, state *RootState, id string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	for _, role := range []string{"e2e-fixture/gastown.witness", "gastown.mayor"} {
+		runE2EStep(t, fmt.Sprintf("gc:session[reset,%s]", role), func(t *testing.T) {
+			var target e2eGascitySession
+			for _, session := range e2eGascityAgentSessions(t, ctx, state, id) {
+				if session.Template == role {
+					target = session
+				}
+			}
+			require.NotEmpty(t, target.SessionName, "%s must be active before reset", role)
+			before := strings.TrimSpace(runE2EGascity(t, ctx, state, id, "tmux", "-L", e2eGascitySocket,
+				"display-message", "-p", "-t", target.SessionName, "#{pane_pid}"))
+			runE2EGascity(t, ctx, state, id, "gc", "session", "reset", target.ID)
+			waitE2EGascityClaude(t, ctx, state, id, target.SessionName, before)
+			waitE2EGascityActive(t, ctx, state, id, target.ID)
+			runE2EAssert(t, "assert:replacement-process-model-and-gateway-preserved", func(t *testing.T) {
+				assertE2EClaudeEnvironment(t, state, id, e2eGascitySocket, target.SessionName)
+				assertE2EGascityLaunch(t, state, id, target.SessionName)
+				if role == "gastown.mayor" {
+					assertE2EGascitySessions(t, state, id)
+				}
+			})
+		})
+	}
+}
+
+func e2eGascityFixtureWorkspace(t *testing.T) e2eFixtureWorkspace {
+	t.Helper()
+	return e2eFixtureWorkspace{
+		checkCommand: strings.Join([]string{
+			"test -f '" + e2eGascityCityDir + "/city.toml'",
+			"git -C '" + e2eGascityRepo + "' rev-parse --is-inside-work-tree >/dev/null",
+			`cd '` + e2eGascityCityDir + `' && PATH="$HOME/.local/bin:$PATH" gc rig list --json 2>/dev/null | jq -e '.rigs[] | select(.name == "e2e-fixture" and .path == "` + e2eGascityRepo + `")' >/dev/null`,
+		}, " && "),
+		description: e2eGascityCityDir + "/city.toml, git workspace " + e2eGascityRepo + " and its e2e-fixture rig",
+		repository:  e2eGascityRepo,
+	}
 }
 
 func runE2ERecordScenario(t *testing.T, root *cobra.Command, tb *dockerTestBuf, state *RootState, lab, orch string) {
 	t.Helper()
 	const recordName = "e2e-status"
 
-	var castPath string
+	var castPath, recorderTTY string
+	const captureMarker = "TAXIWAY_RECORDING_E2E_MARKER"
 	recordingPresent := false
 	t.Cleanup(func() {
 		if !recordingPresent {
@@ -869,6 +2527,46 @@ func runE2ERecordScenario(t *testing.T, root *cobra.Command, tb *dockerTestBuf, 
 			require.Contains(t, out, "Recording started: "+recordName)
 			require.Contains(t, out, ".cast")
 		})
+
+		runE2EAssert(t, "assert:recorder-client-live", func(t *testing.T) {
+			session := requireE2ERecordingSession(t, state, lab, recordName)
+			t.Cleanup(func() {
+				if !t.Failed() {
+					return
+				}
+				data, err := os.ReadFile(session.CastPathHost)
+				if err != nil {
+					t.Logf("recorder diagnostic: cast unreadable: %v", err)
+					return
+				}
+				if len(data) > 2048 {
+					data = data[:2048]
+				}
+				t.Logf("recorder diagnostic (bounded fixture cast): %s", data)
+			})
+			require.Eventually(t, func() bool {
+				res, err := state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "has-session", "-t", "=" + session.RecorderSession}})
+				if err != nil || res.ExitCode != 0 {
+					return false
+				}
+				var tty, clients bytes.Buffer
+				res, err = state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "show-option", "-qv", "-t", session.RecorderSession, "@taxiway-recorder-client"}, Stdout: &tty})
+				if err != nil || res.ExitCode != 0 || strings.TrimSpace(tty.String()) == "" {
+					return false
+				}
+				res, err = state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "list-clients", "-F", "#{client_tty}"}, Stdout: &clients})
+				if err != nil || res.ExitCode != 0 {
+					return false
+				}
+				recorderTTY = strings.TrimSpace(tty.String())
+				for _, client := range strings.Split(strings.TrimSpace(clients.String()), "\n") {
+					if client == recorderTTY {
+						return true
+					}
+				}
+				return false
+			}, 10*time.Second, 100*time.Millisecond, "recorder must remain alive with its own attached client before stop")
+		})
 	})
 
 	statusInput := e2eExpectations(t, orch).recordInput
@@ -879,10 +2577,64 @@ func runE2ERecordScenario(t *testing.T, root *cobra.Command, tb *dockerTestBuf, 
 		})
 	})
 
+	runE2EStep(t, "tmux:display-message[recorder-capture-marker]", func(t *testing.T) {
+		res, err := state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "display-message", "-c", recorderTTY, "-d", "2000", captureMarker}})
+		require.NoError(t, err)
+		require.Zero(t, res.ExitCode)
+		runE2EAssert(t, "assert:real-recorder-output-captured", func(t *testing.T) {
+			session := requireE2ERecordingSession(t, state, lab, recordName)
+			require.Eventually(t, func() bool {
+				data, err := os.ReadFile(session.CastPathHost)
+				if err != nil {
+					return false
+				}
+				var output strings.Builder
+				for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n"))[1:] {
+					var event []json.RawMessage
+					if json.Unmarshal(line, &event) != nil || len(event) != 3 {
+						continue
+					}
+					var kind, text string
+					if json.Unmarshal(event[1], &kind) == nil && kind == "o" && json.Unmarshal(event[2], &text) == nil {
+						output.WriteString(text)
+					}
+				}
+				return strings.Contains(output.String(), captureMarker)
+			}, 10*time.Second, 100*time.Millisecond, "cast must contain output shown to the live recorder client")
+		})
+	})
+
+	t.Cleanup(func() {
+		_, _ = state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "set-option", "-g", "prefix", "C-b"}})
+	})
+	runE2EStep(t, "tmux:set-option[prefix=C-a]", func(t *testing.T) {
+		res, err := state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "set-option", "-g", "prefix", "C-a"}})
+		require.NoError(t, err)
+		require.Zero(t, res.ExitCode)
+		runE2EAssert(t, "assert:recorder-survives-nondefault-prefix", func(t *testing.T) {
+			var prefix bytes.Buffer
+			res, err = state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "show-option", "-gv", "prefix"}, Stdout: &prefix})
+			require.NoError(t, err)
+			require.Zero(t, res.ExitCode)
+			require.Equal(t, "C-a", strings.TrimSpace(prefix.String()))
+			session := requireE2ERecordingSession(t, state, lab, recordName)
+			res, err = state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "has-session", "-t", "=" + session.RecorderSession}})
+			require.NoError(t, err)
+			require.Zero(t, res.ExitCode)
+		})
+	})
+
 	runE2EStep(t, "taxiway:record[stop]", func(t *testing.T) {
 		out := runE2ECommand(t, root, tb, "record", "stop", lab)
 		runE2EAssert(t, "assert:recording-stopped", func(t *testing.T) {
 			require.Contains(t, out, "Recording stopped: "+recordName)
+			session := requireE2ERecordingSession(t, state, lab, recordName)
+			res, err := state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "has-session", "-t", "=" + session.RecorderSession}})
+			require.NoError(t, err)
+			require.NotZero(t, res.ExitCode)
+			res, err = state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"tmux", "has-session", "-t", "=" + orch}})
+			require.NoError(t, err)
+			require.Zero(t, res.ExitCode)
 			require.Contains(t, out, ".cast")
 		})
 	})
@@ -903,6 +2655,141 @@ func runE2ERecordScenario(t *testing.T, root *cobra.Command, tb *dockerTestBuf, 
 		})
 	})
 
+	runE2EStep(t, "taxiway:record[start,stop,rm,list,duplicate-name]", func(t *testing.T) {
+		first := requireE2ERecordingSession(t, state, lab, recordName)
+		firstData, err := os.ReadFile(first.CastPathHost)
+		require.NoError(t, err)
+		runE2ECommand(t, root, tb, "record", "start", lab, "--name", recordName)
+		runE2ECommand(t, root, tb, "record", "stop", lab, "--name", recordName)
+		store := recording.NewStore(config.StateDir(state.Flags.StateDir, state.RepoDir), lab)
+		idx, err := store.Load()
+		require.NoError(t, err)
+		runE2EAssert(t, "assert:existing-cast-preserved-on-duplicate-name", func(t *testing.T) {
+			require.Len(t, idx.Sessions, 2)
+			preserved, err := os.ReadFile(first.CastPathHost)
+			require.NoError(t, err)
+			require.Equal(t, firstData, preserved)
+		})
+		latest := idx.Sessions[1]
+		require.NotEqual(t, first.ID, latest.ID)
+		_, _, err = execDockerRoot(t, root, tb, "record", "rm", lab, "--name", recordName)
+		runE2EAssert(t, "assert:ambiguous-remove-rejected-and-casts-preserved", func(t *testing.T) {
+			require.ErrorContains(t, err, "ambiguous")
+			require.FileExists(t, first.CastPathHost)
+			require.FileExists(t, latest.CastPathHost)
+		})
+		out := runE2ECommand(t, root, tb, "record", "list", lab)
+		runE2EAssert(t, "assert:duplicate-recording-id-listed", func(t *testing.T) {
+			require.Contains(t, out, latest.ID)
+		})
+		runE2ECommand(t, root, tb, "record", "rm", lab, "--id", latest.ID)
+		runE2EAssert(t, "assert:remove-by-id-preserves-other-cast", func(t *testing.T) {
+			require.NoFileExists(t, latest.CastPathHost)
+			require.FileExists(t, first.CastPathHost)
+		})
+	})
+	runE2EStep(t, "fixture:poison-recording-index[outside,symlink]", func(t *testing.T) {
+		store := recording.NewStore(config.StateDir(state.Flags.StateDir, state.RepoDir), lab)
+		indexPath := filepath.Join(store.Dir(), "recordings.json")
+		original, err := os.ReadFile(indexPath)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, os.WriteFile(indexPath, original, 0600)) }()
+		outside := filepath.Join(t.TempDir(), "sentinel.cast")
+		require.NoError(t, os.WriteFile(outside, []byte("harmless outside sentinel"), 0600))
+		for _, mode := range []string{"outside", "symlink"} {
+			var idx recording.Index
+			require.NoError(t, json.Unmarshal(original, &idx))
+			session := &idx.Sessions[0]
+			session.CastPathHost = outside
+			link := filepath.Join(store.Dir(), "containment.cast")
+			if mode == "symlink" {
+				session.CastPathHost = link
+				session.CastPath = "/lab/recordings/containment.cast"
+			}
+			data, err := json.Marshal(idx)
+			require.NoError(t, err)
+			script := "printf %s " + shellQuote(string(data)) + " > /lab/recordings/recordings.json"
+			if mode == "symlink" {
+				script += "; ln -s " + shellQuote(outside) + " /lab/recordings/containment.cast"
+			}
+			res, err := state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{Argv: []string{"bash", "-lc", script}})
+			require.NoError(t, err)
+			require.Zero(t, res.ExitCode)
+			defer os.Remove(link)
+			for _, args := range [][]string{{"record", "list", lab}, {"record", "rm", lab, "--id", session.ID}, {"record", "analyze", lab, "--prompt-only"}} {
+				out, _, err := execDockerRoot(t, root, tb, args...)
+				runE2EAssert(t, "assert:unsafe-recording-rejected-and-files-preserved:"+mode+":"+args[1], func(t *testing.T) {
+					require.Error(t, err)
+					require.NotContains(t, out, outside)
+					current, err := os.ReadFile(indexPath)
+					require.NoError(t, err)
+					require.Equal(t, data, current)
+					sentinel, err := os.ReadFile(outside)
+					require.NoError(t, err)
+					require.Equal(t, "harmless outside sentinel", string(sentinel))
+				})
+			}
+		}
+		require.NoError(t, os.WriteFile(indexPath, original, 0600))
+		prompt := runE2ECommand(t, root, tb, "record", "analyze", lab, "--prompt-only")
+		runE2EAssert(t, "assert:restored-recording-included-in-analysis-prompt", func(t *testing.T) {
+			captured, err := os.ReadFile(castPath)
+			require.NoError(t, err)
+			require.NotEmpty(t, captured)
+			require.Contains(t, prompt, string(captured))
+		})
+	})
+	runE2EStep(t, "fixture:corrupt-index-and-record-list[global]", func(t *testing.T) {
+		bad := recording.NewStore(config.StateDir(state.Flags.StateDir, state.RepoDir), "e2e-corrupt-index")
+		require.NoError(t, bad.Save(recording.Index{}))
+		defer os.RemoveAll(filepath.Dir(bad.Dir()))
+		require.NoError(t, os.WriteFile(filepath.Join(bad.Dir(), "recordings.json"), []byte("invalid"), 0600))
+		out, warning, err := execDockerRoot(t, root, tb, "record", "list")
+		runE2EAssert(t, "assert:global-list-preserves-valid-recordings-and-warns", func(t *testing.T) {
+			require.NoError(t, err)
+			require.Contains(t, out, recordName)
+			require.Contains(t, warning, "e2e-corrupt-index")
+		})
+	})
+	runE2EStep(t, "taxiway:record[player,--write-only,symlink-fixture]", func(t *testing.T) {
+		runE2ECommand(t, root, tb, "record", "player", lab, "--write-only")
+		store := recording.NewStore(config.StateDir(state.Flags.StateDir, state.RepoDir), lab)
+		root, err := store.OpenRoot(false)
+		require.NoError(t, err)
+		defer root.Close()
+		server := httptest.NewServer(http.FileServer(http.FS(recording.PlayerFiles(root))))
+		defer server.Close()
+		client := &http.Client{Timeout: 5 * time.Second}
+		runE2EAssert(t, "assert:offline-player-assets-and-cast-served", func(t *testing.T) {
+			for _, file := range []string{"index.html", "player/asciinema-player.min.js", "player/asciinema-player.css", "player/LICENSE", filepath.Base(castPath)} {
+				response, err := client.Get(server.URL + "/" + file)
+				require.NoError(t, err)
+				data, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				require.NoError(t, err)
+				require.Equal(t, http.StatusOK, response.StatusCode)
+				require.NotEmpty(t, data)
+				if file == "index.html" {
+					require.NotContains(t, string(data), "https://")
+					require.Contains(t, string(data), "player/asciinema-player.min.js")
+				}
+			}
+		})
+		outside := filepath.Join(t.TempDir(), "sentinel.cast")
+		require.NoError(t, os.WriteFile(outside, []byte("harmless outside sentinel"), 0600))
+		link := filepath.Join(store.Dir(), "containment.cast")
+		require.NoError(t, os.Symlink(outside, link))
+		defer os.Remove(link)
+		response, err := client.Get(server.URL + "/containment.cast")
+		require.NoError(t, err)
+		data, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		require.NoError(t, err)
+		runE2EAssert(t, "assert:player-rejects-outside-symlink", func(t *testing.T) {
+			require.NotEqual(t, http.StatusOK, response.StatusCode)
+			require.NotContains(t, string(data), "harmless outside sentinel")
+		})
+	})
 	runE2EStep(t, "taxiway:record[rm,--name=e2e-status]", func(t *testing.T) {
 		out := runE2ECommand(t, root, tb, "record", "rm", lab, "--name", recordName)
 		recordingPresent = false
@@ -920,6 +2807,53 @@ func runE2ERecordScenario(t *testing.T, root *cobra.Command, tb *dockerTestBuf, 
 			require.NotContains(t, out, recordName)
 		})
 	})
+
+	for _, stoppedLab := range []bool{false, true} {
+		for _, remove := range []bool{false, true} {
+			name := fmt.Sprintf("e2e-recovery-stopped-%t-remove-%t", stoppedLab, remove)
+			runE2EStep(t, "taxiway:record[start,interrupt,stop-or-rm,recovery,"+name+"]", func(t *testing.T) {
+				runE2ECommand(t, root, tb, "record", "start", lab, "--name", name)
+				session := requireE2ERecordingSession(t, state, lab, name)
+				runE2EAssert(t, "assert:recovery-recording-cast-started", func(t *testing.T) {
+					assertE2EAsciicastFile(t, session.CastPathHost)
+				})
+				if stoppedLab {
+					runE2ECommand(t, root, tb, "down", lab)
+				} else {
+					res, err := state.Driver.Exec(context.Background(), idName(lab), driver.ExecRequest{
+						Argv: []string{"tmux", "kill-session", "-t", "=" + session.RecorderSession},
+					})
+					require.NoError(t, err)
+					require.Zero(t, res.ExitCode)
+				}
+				if remove {
+					runE2ECommand(t, root, tb, "record", "rm", lab, "--name", name, "--force")
+					runE2EAssert(t, "assert:interrupted-recording-force-removed", func(t *testing.T) {
+						require.NoFileExists(t, session.CastPathHost)
+					})
+					out := runE2ECommand(t, root, tb, "record", "list", lab)
+					runE2EAssert(t, "assert:removed-recovery-recording-absent", func(t *testing.T) {
+						require.NotContains(t, out, name)
+					})
+				} else {
+					runE2ECommand(t, root, tb, "record", "stop", lab, "--name", name)
+					runE2EAssert(t, "assert:interrupted-recording-reconciled-stopped", func(t *testing.T) {
+						recovered := requireE2ERecordingSession(t, state, lab, name)
+						require.Equal(t, recording.StateStopped, recovered.State)
+						require.NotNil(t, recovered.StoppedAt)
+						assertE2EAsciicastFile(t, session.CastPathHost)
+					})
+					runE2ECommand(t, root, tb, "record", "rm", lab, "--name", name)
+				}
+				if stoppedLab {
+					runE2ECommand(t, root, tb, "up", lab, "--skip-auth-check")
+					runE2EAssert(t, "assert:shell-target-ready-after-recording-recovery", func(t *testing.T) {
+						assertE2EShellCheck(t, root, tb, lab, orch)
+					})
+				}
+			})
+		}
+	}
 }
 
 func requireE2ERecordingSession(t *testing.T, state *RootState, lab, name string) recording.Session {
@@ -966,7 +2900,7 @@ func e2eGastownFixtureWorkspace(t *testing.T) e2eFixtureWorkspace {
 	require.NoError(t, err)
 	crewName := sanitizeIdentifier(rawCrew)
 	hqMarker := "/lab/work/gt/.taxiway-hq-initialized"
-	rigDir := "/lab/work/gt/agreement_hub"
+	rigDir := "/lab/work/gt/e2e_fixture"
 	crewDir := rigDir + "/crew/" + crewName
 	return e2eFixtureWorkspace{
 		checkCommand: strings.Join([]string{
@@ -982,7 +2916,7 @@ func e2eGastownFixtureWorkspace(t *testing.T) e2eFixtureWorkspace {
 
 func e2ePlainFixtureWorkspace(t *testing.T) e2eFixtureWorkspace {
 	t.Helper()
-	const workspaceDir = "/lab/work/agreement-hub"
+	const workspaceDir = "/lab/work/e2e-fixture"
 	return e2eFixtureWorkspace{
 		checkCommand: "test -d '" + workspaceDir + "/.git'",
 		description:  workspaceDir + "/.git",
@@ -1032,6 +2966,7 @@ func assertE2ERuntimeDestroyed(t *testing.T, state *RootState) {
 	proxy := state.proxyRuntime()
 
 	require.Equal(t, "missing", e2eDockerContainerState(t, proxy.Container), "proxy must be removed")
+	require.False(t, e2eDockerNetworkExists(t, proxy.DockerNetwork()), "proxy network must be removed")
 	require.Empty(t, e2eDockerNames("container", runtime.ComposeProject+"-"), "observability containers must be removed")
 	require.Empty(t, e2eDockerNames("volume", runtime.ComposeProject+"_"), "observability volumes must be removed")
 	require.False(t, e2eDockerNetworkExists(t, runtime.DockerNetwork()), "observability network must be removed")
@@ -1059,11 +2994,32 @@ func e2eDockerNetworkExists(t *testing.T, name string) bool {
 	return err == nil
 }
 
-func startE2EFakeOpenAIUpstream(t *testing.T) string {
+// Protocol fixtures extend the same upstream used by the existing lifecycle
+// scenarios. Unique input markers keep background roles away from fixture replies.
+type e2eProtocolFixture struct {
+	status            int
+	contentType, body string
+	requests          []e2eProtocolRequest
+}
+
+type e2eProtocolRequest struct {
+	path    string
+	headers http.Header
+	payload map[string]any
+}
+
+type e2eModelUpstream struct {
+	baseURL  string
+	mu       sync.Mutex
+	fixtures map[string]*e2eProtocolFixture
+}
+
+func startE2EFakeModelUpstream(t *testing.T) *e2eModelUpstream {
 	t.Helper()
 	var mu sync.Mutex
 	var modelCalls int
 	var requests []string
+	fixtureUpstream := &e2eModelUpstream{fixtures: map[string]*e2eProtocolFixture{}}
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
 	require.NoError(t, err)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1071,67 +3027,111 @@ func startE2EFakeOpenAIUpstream(t *testing.T) string {
 		requests = append(requests, r.Method+" "+r.URL.Path)
 		mu.Unlock()
 		if r.URL.Path == "/v1/models" {
-			writeE2EJSON(t, w, map[string]any{
-				"object": "list",
-				"data": []map[string]any{{
-					"id":       "e2e-smoke",
-					"object":   "model",
-					"created":  0,
-					"owned_by": "taxiway-e2e",
-				}},
-			})
+			writeE2EJSON(t, w, map[string]any{"object": "list", "data": []map[string]any{{"id": "e2e-smoke", "object": "model", "owned_by": "taxiway-e2e"}}})
 			return
 		}
-		if r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+		if r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/backend-api/codex/responses") {
+			var payload struct {
+				Model  string `json:"model"`
+				Stream bool   `json:"stream"`
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+			if err != nil || json.Unmarshal(body, &payload) != nil {
+				http.Error(w, "invalid fixture request", http.StatusBadRequest)
+				return
+			}
+			fixtureUpstream.mu.Lock()
+			for marker, fixture := range fixtureUpstream.fixtures {
+				if bytes.Contains(body, []byte(marker)) {
+					var decoded map[string]any
+					require.NoError(t, json.Unmarshal(body, &decoded))
+					fixture.requests = append(fixture.requests, e2eProtocolRequest{r.URL.Path, r.Header.Clone(), decoded})
+					status, contentType, response := fixture.status, fixture.contentType, fixture.body
+					fixtureUpstream.mu.Unlock()
+					w.Header().Set("Content-Type", contentType)
+					w.WriteHeader(status)
+					_, _ = io.WriteString(w, response)
+					return
+				}
+			}
+			fixtureUpstream.mu.Unlock()
+			if r.URL.Path == "/v1/messages" {
+				providerKeyMatches := r.Header.Get("x-api-key") == "sk-e2e-upstream"
+				authorizationPresent := r.Header.Get("Authorization") != ""
+				if !providerKeyMatches || authorizationPresent {
+					t.Errorf("Anthropic API fixture auth mismatch: provider-key-match=%t, authorization-present=%t", providerKeyMatches, authorizationPresent)
+					http.Error(w, "fixture-upstream-auth-mismatch", http.StatusUnauthorized)
+					return
+				}
+			}
 			mu.Lock()
 			modelCalls++
 			mu.Unlock()
-			writeE2EJSON(t, w, map[string]any{
-				"id":      "chatcmpl-taxiway-e2e",
-				"object":  "chat.completion",
-				"created": time.Now().Unix(),
-				"model":   "e2e-smoke",
-				"choices": []map[string]any{{
-					"index": 0,
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": e2eFakeModelResponse,
-					},
-					"finish_reason": "stop",
-				}},
-				"usage": map[string]any{
-					"prompt_tokens":     1,
-					"completion_tokens": 1,
-					"total_tokens":      2,
-				},
-			})
-			return
-		}
-		if r.Method == http.MethodPost && r.URL.Path == "/v1/responses" {
-			mu.Lock()
-			modelCalls++
-			mu.Unlock()
-			writeE2EJSON(t, w, map[string]any{
-				"id":         "resp-taxiway-e2e",
-				"object":     "response",
-				"created_at": time.Now().Unix(),
-				"status":     "completed",
-				"model":      "e2e-smoke",
-				"output": []map[string]any{{
-					"id":     "msg-taxiway-e2e",
-					"type":   "message",
-					"status": "completed",
-					"role":   "assistant",
-					"content": []map[string]any{{
-						"type": "output_text",
-						"text": e2eFakeModelResponse,
-					}},
-				}},
-				"usage": map[string]any{
-					"input_tokens":  1,
-					"output_tokens": 1,
-				},
-			})
+			responseText := e2eFakeModelResponse
+			nonces := regexp.MustCompile(`taxiway-readiness-[0-9a-f]+(?:-blocked)?`).FindAll(body, -1)
+			if len(nonces) > 0 {
+				lastNonce := nonces[len(nonces)-1]
+				if bytes.HasSuffix(lastNonce, []byte("-blocked")) {
+					http.Error(w, "fixture-request-blocked", http.StatusForbidden)
+					return
+				}
+				responseText = fmt.Sprintf("%x", sha256.Sum256(lastNonce))
+			}
+			if r.URL.Path == "/v1/messages" {
+				message := map[string]any{
+					"id": "msg-taxiway-e2e", "type": "message", "role": "assistant", "model": payload.Model,
+					"content":     []map[string]any{{"type": "text", "text": responseText}},
+					"stop_reason": "end_turn", "stop_sequence": nil,
+					"usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
+				}
+				if !payload.Stream {
+					writeE2EJSON(t, w, message)
+					return
+				}
+				message["content"], message["stop_reason"] = []any{}, nil
+				w.Header().Set("Content-Type", "text/event-stream")
+				for _, event := range []map[string]any{
+					{"type": "message_start", "message": message},
+					{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}},
+					{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": responseText}},
+					{"type": "content_block_stop", "index": 0},
+					{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 1}},
+					{"type": "message_stop"},
+				} {
+					data, _ := json.Marshal(event)
+					_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event["type"], data)
+				}
+				return
+			}
+			item := map[string]any{
+				"id": "msg-taxiway-e2e", "type": "message", "status": "completed", "role": "assistant",
+				"content": []map[string]any{{"type": "output_text", "text": responseText, "annotations": []any{}}},
+			}
+			response := map[string]any{
+				"id": "resp-taxiway-e2e", "object": "response", "created_at": time.Now().Unix(),
+				"status": "completed", "model": payload.Model, "output": []any{item}, "error": nil, "incomplete_details": nil,
+				"usage": map[string]any{"input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+					"input_tokens_details": map[string]any{"cached_tokens": 0}, "output_tokens_details": map[string]any{"reasoning_tokens": 0}},
+			}
+			started := map[string]any{}
+			for key, value := range response {
+				started[key] = value
+			}
+			started["status"] = "in_progress"
+			started["output"] = []any{}
+			w.Header().Set("Content-Type", "text/event-stream")
+			for _, event := range []map[string]any{
+				{"type": "response.created", "response": started, "sequence_number": 0},
+				{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"id": "msg-taxiway-e2e", "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}}, "sequence_number": 1},
+				{"type": "response.content_part.added", "output_index": 0, "content_index": 0, "item_id": "msg-taxiway-e2e", "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}, "sequence_number": 2},
+				{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": "msg-taxiway-e2e", "delta": responseText, "sequence_number": 3},
+				{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": "msg-taxiway-e2e", "text": responseText, "sequence_number": 4},
+				{"type": "response.output_item.done", "output_index": 0, "item": item, "sequence_number": 5},
+				{"type": "response.completed", "response": response, "sequence_number": 6},
+			} {
+				data, _ := json.Marshal(event)
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event["type"], data)
+			}
 			return
 		}
 		http.NotFound(w, r)
@@ -1150,7 +3150,8 @@ func startE2EFakeOpenAIUpstream(t *testing.T) string {
 	})
 	_, port, err := net.SplitHostPort(listener.Addr().String())
 	require.NoError(t, err)
-	return "http://host.docker.internal:" + port
+	fixtureUpstream.baseURL = "http://host.docker.internal:" + port
+	return fixtureUpstream
 }
 
 func writeE2EJSON(t *testing.T, w http.ResponseWriter, value any) {
@@ -1161,20 +3162,114 @@ func writeE2EJSON(t *testing.T, w http.ResponseWriter, value any) {
 
 func configureE2ELiteLLMModelCatalog(t *testing.T, state *RootState, fakeUpstreamBaseURL string) {
 	t.Helper()
+	catalog := e2eSourceModelCatalog(t)
+	selected := map[string]bool{
+		e2ePrincipalModel(t, "codex"):       true,
+		e2ePrincipalModel(t, "claude-code"): true,
+		e2ePrincipalModel(t, "gastown"):     true,
+		e2ePrincipalModel(t, "gascity"):     true,
+	}
+	// Keep public IDs/providers but send every inference request to the fixture.
+	// Freeze lifecycle statuses in this snapshot instead of waiting on public dates.
+	for i := range catalog.Models {
+		model := &catalog.Models[i]
+		model.Status = model.StatusAt(modelNow())
+		model.RetirementDate = ""
+		if selected[model.Name] && !e2eUsesManifestDefault(t) {
+			model.Status = "deprecated"
+		}
+		if model.Provider == "chatgpt" {
+			model.APIBase = fakeUpstreamBaseURL + "/backend-api/codex"
+			model.API = "responses"
+		} else {
+			model.APIBase = fakeUpstreamBaseURL
+			model.APIKey = "sk-e2e-upstream"
+		}
+	}
+	for _, orch := range []string{"codex", "claude-code"} {
+		prefix := "claude"
+		if orch == "codex" {
+			prefix = "gpt"
+		}
+		principal := e2ePrincipalModel(t, orch)
+		for _, status := range []string{"deprecated", "retired"} {
+			catalog.Models = append(catalog.Models, modelcatalog.Model{
+				Name: prefix + "-e2e-" + status, Provider: e2eModelProvider(orch),
+				Upstream: principal, Status: status, Replacement: principal,
+			})
+		}
+	}
+	data, err := yaml.Marshal(catalog)
+	require.NoError(t, err)
 	modelsPath := filepath.Join(state.RepoDir, "infra", "gateway", "litellm", "models.yaml")
-	content := fmt.Sprintf(`models:
-  - name: gpt-5.5
-    provider: openai
-    upstream: e2e-smoke
-    api_base: %[1]s/v1
-    api_key: sk-e2e-upstream
-  - name: claude-opus-4-8
-    provider: openai
-    upstream: e2e-smoke
-    api_base: %[1]s/v1
-    api_key: sk-e2e-upstream
-`, fakeUpstreamBaseURL)
-	require.NoError(t, os.WriteFile(modelsPath, []byte(content), 0o644))
+	require.NoError(t, os.WriteFile(modelsPath, data, 0o644))
+	// ChatGPT's native adapter resolves its base through this environment
+	// variable even when model parameters contain api_base. Set it in the
+	// copied callback loaded inside the test sidecar, never in shipped assets.
+	mapperPath := liteLLMCodexSessionMapperAssetPath(state)
+	mapper, err := os.ReadFile(mapperPath)
+	require.NoError(t, err)
+	mapper = append(mapper, []byte(fmt.Sprintf("\nimport os\nos.environ['CHATGPT_API_BASE'] = %q\n", fakeUpstreamBaseURL+"/backend-api/codex"))...)
+	require.NoError(t, os.WriteFile(mapperPath, mapper, 0o644))
+	// TestMain isolates HOME. Only fake credentials are created, never host auth.
+	requirePathUnder(t, defaultCodexAuthFile(), e2eTestRoot)
+	require.NoError(t, os.MkdirAll(filepath.Dir(defaultCodexAuthFile()), 0o700))
+	require.NoError(t, os.WriteFile(defaultCodexAuthFile(), []byte(`{
+  "access_token":"e2e-fake-access", "refresh_token":"e2e-fake-refresh",
+  "id_token":"e2e-fake-id", "account_id":"e2e-fake-account", "expires_at":32503680000
+ }`), 0o600))
+	converted, err := ensureLiteLLMChatGPTAuth(authStateDir(state), true)
+	require.NoError(t, err)
+	require.True(t, converted, "fixture auth must be provisioned before starting ChatGPT routes")
+	cache := liteLLMChatGPTAuthStatePath(authStateDir(state))
+	for path, want := range map[string]os.FileMode{filepath.Dir(cache): 0o700, cache: 0o600} {
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		require.Equal(t, want, info.Mode().Perm(), "ChatGPT token cache must stay private: %s", path)
+	}
+}
+
+func assertE2EGatewayModels(t *testing.T, state *RootState, id, orch string) {
+	t.Helper()
+	ref, ok, err := state.Driver.ReadLabRef(context.Background(), id)
+	require.NoError(t, err)
+	require.True(t, ok)
+	if e2eUsesManifestDefault(t) {
+		_, persisted := ref.Settings["model"]
+		require.False(t, persisted, "manifest default must not be persisted as an explicit setting")
+	} else {
+		require.Equal(t, e2eExpectations(t, orch).model, ref.Settings["model"], "explicit principal selection must persist")
+	}
+	values, err := readLabGatewayEnv(config.StateDir(state.Flags.StateDir, state.RepoDir), ref)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	res, err := state.Driver.Exec(ctx, id, driver.ExecRequest{
+		Argv:   []string{"curl", "-fsS", "--max-time", "15", "-H", "x-litellm-api-key: Bearer " + values[labLiteLLMAPIKeyEnv], labLiteLLMBaseURL(state, ref) + "/v1/models"},
+		Stdout: &stdout, Stderr: &stderr,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, res.ExitCode, "gateway model discovery from lab: %s", stderr.String())
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &result))
+	var names []string
+	for _, model := range result.Data {
+		names = append(names, model.ID)
+	}
+	// Controlled fixture entries give independent lifecycle expectations even
+	// if parsing/status logic shared with production regresses.
+	for _, prefix := range []string{"gpt", "claude"} {
+		require.NotContains(t, names, prefix+"-e2e-deprecated")
+		require.NotContains(t, names, prefix+"-e2e-retired")
+	}
+	require.Contains(t, names, e2ePrincipalModel(t, orch), "principal must remain exposed, including an explicitly selected deprecated model")
+	require.ElementsMatch(t, e2eGatewayModelNames(t, orch), names,
+		"gateway must expose the provider catalog, retain the selected deprecated principal, and exclude other providers/retired/unselected deprecated models")
 }
 
 func assertE2EGatewayRuntimeRunning(t *testing.T, state *RootState, lab, orch string) {
@@ -1195,47 +3290,295 @@ func assertE2EGatewayRuntimeRunning(t *testing.T, state *RootState, lab, orch st
 	require.Contains(t, services, "postgres")
 }
 
-func assertE2EGatewayRequestRouted(t *testing.T, state *RootState, lab, orch string, fakeUpstreamBaseURL string) {
+func assertE2EGatewayRequestRouted(t *testing.T, state *RootState, lab, orch string, upstream *e2eModelUpstream) {
 	t.Helper()
 	ref := config.LabRef{Lab: lab, Orch: orch, Driver: state.Driver.Name()}
 	values, err := readLabGatewayEnv(config.StateDir(state.Flags.StateDir, state.RepoDir), ref)
 	require.NoError(t, err)
 	apiKey := values[labLiteLLMAPIKeyEnv]
 	require.NotEmpty(t, apiKey)
-	model := e2eExpectations(t, orch).model
-
-	deadline := time.Now().Add(90 * time.Second)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		hostContent, err := callE2ELiteLLMChatCompletion(state, lab, apiKey, model)
-		if err == nil {
-			labContent, labErr := callE2ELiteLLMChatCompletionFromLab(state, ref, apiKey, model)
-			if labErr == nil {
-				require.Equal(t, e2eFakeModelResponse, hostContent)
-				require.Equal(t, e2eFakeModelResponse, labContent)
-				return
+	for _, model := range e2eGatewayModelNames(t, orch) {
+		t.Logf("routing model=%s from host and guest", model)
+		{
+			deadline := time.Now().Add(90 * time.Second)
+			var lastErr error
+			for time.Now().Before(deadline) {
+				hostContent, err := callE2ELiteLLMModel(state, lab, apiKey, orch, model)
+				if err == nil {
+					labContent, labErr := callE2ELiteLLMModelFromLab(state, ref, apiKey, model)
+					if labErr == nil {
+						require.Equal(t, e2eFakeModelResponse, hostContent)
+						require.Equal(t, e2eFakeModelResponse, labContent)
+						lastErr = nil
+						break
+					}
+					err = labErr
+				}
+				lastErr = err
+				time.Sleep(2 * time.Second)
 			}
-			err = labErr
+			require.NoError(t, lastErr, "model %s must route via fake upstream %s\n%s", model, upstream.baseURL, collectE2ELiteLLMDiagnostics(t, state, ref, upstream.baseURL))
 		}
-		lastErr = err
-		time.Sleep(2 * time.Second)
 	}
-	require.NoError(t, lastErr, "LiteLLM smoke via %s should reach fake upstream %s\n%s", labLiteLLMBaseURL(state, ref), fakeUpstreamBaseURL, collectE2ELiteLLMDiagnostics(t, state, ref, fakeUpstreamBaseURL))
+
 }
 
-func callE2ELiteLLMChatCompletion(state *RootState, lab, apiKey, model string) (string, error) {
-	body := strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"smoke"}],"max_tokens":8}`, model))
-	req, err := http.NewRequest(http.MethodPost, state.proxyRuntime().BaseURL()+"/v1/chat/completions", body)
+// These assertions run against the lifecycle scenario's real lab gateway, with
+// its database and telemetry enabled. The fixture never opens another sidecar.
+func assertE2EGatewayProtocol(t *testing.T, state *RootState, lab, orch string, upstream *e2eModelUpstream) {
+	ref := config.LabRef{Lab: lab, Orch: orch, Driver: state.Driver.Name()}
+	values, err := readLabGatewayEnv(config.StateDir(state.Flags.StateDir, state.RepoDir), ref)
+	require.NoError(t, err)
+	apiKey := values[labLiteLLMAPIKeyEnv]
+	require.NotEmpty(t, apiKey)
+	t.Helper()
+	contract := "model text response"
+	request := func(t *testing.T, marker, endpoint, mode string, payload map[string]any, status int, contentType, reply string) ([]byte, []e2eProtocolRequest) {
+		t.Helper()
+		t.Logf("protocol contract=%s mode=%s model=%v expected_status=%d marker=%s", contract, mode, payload["model"], status, marker)
+		fixture := &e2eProtocolFixture{status: status, contentType: contentType, body: reply}
+		upstream.mu.Lock()
+		upstream.fixtures[marker] = fixture
+		upstream.mu.Unlock()
+		defer func() { upstream.mu.Lock(); delete(upstream.fixtures, marker); upstream.mu.Unlock() }()
+		data, err := json.Marshal(payload)
+		require.NoError(t, err)
+		req, err := http.NewRequest(http.MethodPost, state.proxyRuntime().BaseURL()+endpoint, bytes.NewReader(data))
+		require.NoError(t, err)
+		req.Host = labLiteLLMHost(lab)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-litellm-api-key", "Bearer "+apiKey)
+		req.Header.Set("x-litellm-agent-id", "taxiway-e2e-protocol")
+		if mode == "subscription" {
+			req.Header.Set("Authorization", "Bearer sk-ant-oat01-e2e-fixture")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		client := &http.Client{Timeout: 30 * time.Second}
+		var body []byte
+		var responseCode int
+		for {
+			attempt := req.Clone(ctx)
+			attempt.Body = io.NopCloser(bytes.NewReader(data))
+			response, err := client.Do(attempt)
+			require.NoError(t, err)
+			body, err = io.ReadAll(io.LimitReader(response.Body, 1<<20))
+			response.Body.Close()
+			require.NoError(t, err)
+			responseCode = response.StatusCode
+			// Error fixtures exercise the real router, which briefly cools a
+			// model down. Observe recovery before the next healthy-mode check;
+			// never retry a provider-error fixture or an unrelated failure.
+			if status == http.StatusOK && responseCode == http.StatusTooManyRequests &&
+				bytes.Contains(body, []byte("All deployments for selected model are in cooldown")) {
+				time.Sleep(time.Second)
+				continue
+			}
+			break
+		}
+		require.Equal(t, status, responseCode, "fixture status; response: %s", redactE2EDiagnosticSecrets(string(body)))
+		upstream.mu.Lock()
+		captured := append([]e2eProtocolRequest(nil), fixture.requests...)
+		upstream.mu.Unlock()
+		require.NotEmpty(t, captured, "real lab gateway must call controlled upstream: status=%d model=%v response=%s", status, payload["model"], redactE2EDiagnosticSecrets(string(body)))
+		for _, call := range captured {
+			require.True(t, call.headers.Get("x-litellm-api-key") == "", "gateway key must not reach provider")
+			if orch == "codex" {
+				require.Equal(t, "/backend-api/codex/responses", call.path)
+				require.True(t, call.headers.Get("Authorization") == "Bearer e2e-fake-access", "fake Codex auth must reach provider")
+				require.True(t, call.headers.Get("chatgpt-account-id") == "e2e-fake-account", "fake account must reach provider")
+			} else {
+				require.Equal(t, "/v1/messages", strings.Split(call.path, "?")[0])
+				if mode == "subscription" {
+					require.True(t, call.headers.Get("Authorization") == "Bearer sk-ant-oat01-e2e-fixture", "fake subscription auth must reach provider")
+				} else {
+					require.True(t, call.headers.Get("x-api-key") == "sk-e2e-upstream", "fake API key must reach provider")
+				}
+			}
+		}
+		return body, captured
+	}
+	jsonText := func(t *testing.T, value any) string {
+		data, err := json.Marshal(value)
+		require.NoError(t, err)
+		return string(data)
+	}
+	events := func(t *testing.T, body []byte) []map[string]any {
+		var result []map[string]any
+		for _, line := range bytes.Split(body, []byte("\n")) {
+			if !bytes.HasPrefix(line, []byte("data: ")) || bytes.Equal(line[6:], []byte("[DONE]")) {
+				continue
+			}
+			var event map[string]any
+			require.NoError(t, json.Unmarshal(line[6:], &event))
+			result = append(result, event)
+		}
+		require.NotEmpty(t, result, "fixture SSE response: %s", redactE2EDiagnosticSecrets(string(body)))
+		return result
+	}
+	stream := func(t *testing.T, items []map[string]any) string {
+		var body strings.Builder
+		for _, event := range items {
+			fmt.Fprintf(&body, "event: %s\ndata: %s\n\n", event["type"], jsonText(t, event))
+		}
+		return body.String()
+	}
+	marker := func() string { return fmt.Sprintf("taxiway-protocol-%x", time.Now().UnixNano()) }
+	models := e2eGatewayModelNames(t, orch)
+	modes := []string{"api-key", "subscription"}
+	endpoint := "/v1/messages"
+	if orch == "codex" {
+		modes = []string{"chatgpt"}
+		endpoint = "/v1/responses"
+	}
+	for _, mode := range modes {
+		t.Logf("protocol auth mode=%s", mode)
+		{
+			anthropicReply := func(model string, content any, reason any) map[string]any {
+				return map[string]any{"id": "msg_fixture", "type": "message", "role": "assistant", "model": model, "content": content, "stop_reason": reason, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 10, "output_tokens": 4}}
+			}
+			codexReply := func(model string, output any) map[string]any {
+				return map[string]any{"id": "resp_fixture", "object": "response", "created_at": 1790950000, "status": "completed", "model": model, "output": output, "error": nil, "incomplete_details": nil, "usage": map[string]any{"input_tokens": 10, "output_tokens": 4, "total_tokens": 14, "input_tokens_details": map[string]any{"cached_tokens": 0}, "output_tokens_details": map[string]any{"reasoning_tokens": 0}}}
+			}
+			codexStream := func(model string, output []any) string {
+				response := codexReply(model, output)
+				initial := codexReply(model, []any{})
+				initial["status"] = "in_progress"
+				result := []map[string]any{{"type": "response.created", "response": initial, "sequence_number": 0}}
+				for index, item := range output {
+					result = append(result, map[string]any{"type": "response.output_item.done", "output_index": index, "item": item, "sequence_number": len(result)})
+				}
+				result = append(result, map[string]any{"type": "response.completed", "response": response, "sequence_number": len(result)})
+				return stream(t, result)
+			}
+			text := map[string]any{"type": "message", "id": "msg_fixture", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "Hello", "annotations": []any{}}}}
+			contract = "model text response"
+			for _, model := range models {
+				m := marker()
+				payload := map[string]any{"model": model, "max_tokens": 128, "messages": []any{map[string]any{"role": "user", "content": m}}}
+				reply := jsonText(t, anthropicReply(model, []any{map[string]any{"type": "text", "text": "Hello"}}, "end_turn"))
+				contentType := "application/json"
+				if orch == "codex" {
+					payload = map[string]any{"model": model, "stream": true, "input": []any{map[string]any{"role": "user", "content": m}}, "reasoning": map[string]any{"effort": "medium"}, "parallel_tool_calls": false}
+					reply = codexStream(model, []any{text})
+					contentType = "text/event-stream"
+				}
+				body, calls := request(t, m, endpoint, mode, payload, 200, contentType, reply)
+				call := calls[0]
+				require.Equal(t, model, call.payload["model"])
+				if orch == "codex" {
+					require.Equal(t, payload["input"], call.payload["input"])
+					require.Equal(t, payload["reasoning"], call.payload["reasoning"])
+					require.Equal(t, false, call.payload["parallel_tool_calls"])
+					require.Equal(t, true, call.payload["stream"])
+					require.Equal(t, false, call.payload["store"])
+					require.Contains(t, call.payload["include"], "reasoning.encrypted_content")
+					actual := events(t, body)
+					require.Equal(t, "response.completed", actual[len(actual)-1]["type"])
+					response := actual[len(actual)-1]["response"].(map[string]any)
+					require.Equal(t, model, response["model"])
+					require.Equal(t, []any{text}, response["output"])
+				} else {
+					require.Equal(t, payload["messages"], call.payload["messages"])
+					var actual map[string]any
+					require.NoError(t, json.Unmarshal(body, &actual))
+					require.Equal(t, "end_turn", actual["stop_reason"])
+					require.Equal(t, []any{map[string]any{"type": "text", "text": "Hello"}}, actual["content"])
+				}
+			}
+			contract = "reasoning and tool result replay"
+			model := models[0]
+			m := marker()
+			if orch == "codex" {
+				reasoning := map[string]any{"type": "reasoning", "id": "rs_fixture", "summary": []any{}, "encrypted_content": "opaque-test-reasoning"}
+				tool := map[string]any{"type": "function_call", "id": "fc_fixture", "call_id": "call_fixture", "name": "read_file", "arguments": "{\"path\":\"README.md\"}", "status": "completed"}
+				payload := map[string]any{"model": model, "stream": true, "input": []any{map[string]any{"role": "user", "content": m}}, "tools": []any{map[string]any{"type": "function", "name": "read_file", "parameters": map[string]any{"type": "object", "properties": map[string]any{}}}}, "parallel_tool_calls": true}
+				body, _ := request(t, m, endpoint, mode, payload, 200, "text/event-stream", codexStream(model, []any{reasoning, tool}))
+				actual := events(t, body)
+				require.Equal(t, "response.completed", actual[len(actual)-1]["type"])
+				output := actual[len(actual)-1]["response"].(map[string]any)["output"].([]any)
+				require.Equal(t, []any{reasoning, tool}, output)
+				payload["input"] = append(append(payload["input"].([]any), output...), map[string]any{"type": "function_call_output", "call_id": "call_fixture", "output": "File contents"})
+				_, calls := request(t, m, endpoint, mode, payload, 200, "text/event-stream", codexStream(model, []any{text}))
+				require.Equal(t, payload["input"], calls[0].payload["input"])
+				require.Equal(t, payload["tools"], calls[0].payload["tools"])
+				require.Equal(t, true, calls[0].payload["parallel_tool_calls"])
+			} else {
+				thinking := map[string]any{"type": "thinking", "thinking": "", "signature": "test-opaque-signature"}
+				tool := map[string]any{"type": "tool_use", "id": "toolu_fixture", "name": "read_file", "input": map[string]any{"path": "README.md"}}
+				tools := []any{map[string]any{"name": "read_file", "description": "Read a file", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}, "required": []any{"path"}}}}
+				payload := map[string]any{"model": model, "max_tokens": 1024, "thinking": map[string]any{"type": "adaptive"}, "tools": tools, "messages": []any{map[string]any{"role": "user", "content": m}}}
+				body, _ := request(t, m, endpoint, mode, payload, 200, "application/json", jsonText(t, anthropicReply(model, []any{thinking, tool}, "tool_use")))
+				var actual map[string]any
+				require.NoError(t, json.Unmarshal(body, &actual))
+				require.Equal(t, []any{thinking, tool}, actual["content"])
+				require.Equal(t, "tool_use", actual["stop_reason"])
+				payload["messages"] = append(payload["messages"].([]any), map[string]any{"role": "assistant", "content": actual["content"]}, map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "toolu_fixture", "content": "File contents"}}})
+				_, calls := request(t, m, endpoint, mode, payload, 200, "application/json", jsonText(t, anthropicReply(model, []any{map[string]any{"type": "text", "text": "Done"}}, "end_turn")))
+				require.Equal(t, payload["messages"], calls[0].payload["messages"])
+				require.Equal(t, payload["thinking"], calls[0].payload["thinking"])
+				require.Equal(t, tools, calls[0].payload["tools"])
+				contract = "streamed signature and text"
+				expected := []map[string]any{
+					{"type": "message_start", "message": anthropicReply(model, []any{}, nil)},
+					{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}},
+					{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "signature_delta", "signature": "test-opaque-signature"}},
+					{"type": "content_block_stop", "index": 0},
+					{"type": "content_block_start", "index": 1, "content_block": map[string]any{"type": "text", "text": ""}},
+					{"type": "content_block_delta", "index": 1, "delta": map[string]any{"type": "text_delta", "text": "Hello"}},
+					{"type": "content_block_stop", "index": 1},
+					{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 4}},
+					{"type": "message_stop"},
+				}
+				payload["stream"] = true
+				body, _ = request(t, m, endpoint, mode, payload, 200, "text/event-stream", stream(t, expected))
+				got := events(t, body)
+				require.Len(t, got, len(expected))
+				for i := range expected {
+					require.Equal(t, expected[i]["type"], got[i]["type"])
+				}
+				require.Equal(t, expected[2]["delta"], got[2]["delta"])
+				require.Equal(t, expected[5]["delta"], got[5]["delta"])
+				require.Equal(t, expected[7]["delta"], got[7]["delta"])
+			}
+			// Distinct models avoid router cooldown masking the second provider error.
+			contract = "provider error passthrough"
+			for index, code := range []int{401, 429} {
+				model := models[len(models)-2+index]
+				m := marker()
+				payload := map[string]any{"model": model, "max_tokens": 128, "messages": []any{map[string]any{"role": "user", "content": m}}}
+				if orch == "codex" {
+					payload = map[string]any{"model": model, "stream": true, "input": m}
+				}
+				errorType := map[int]string{401: "authentication_error", 429: "rate_limit_error"}[code]
+				_, calls := request(t, m, endpoint, mode, payload, code, "application/json", jsonText(t, map[string]any{"type": "error", "error": map[string]any{"type": errorType, "message": "Fixture provider error"}}))
+				for _, call := range calls {
+					require.Equal(t, model, call.payload["model"])
+				}
+			}
+		}
+	}
+}
+
+func e2eModelRequest(orch, model string) (string, string) {
+	if orch == "codex" {
+		return "/v1/responses", fmt.Sprintf(`{"model":%q,"stream":true,"input":[{"role":"user","content":"smoke"}],"parallel_tool_calls":false}`, model)
+	}
+	return "/v1/messages", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"smoke"}],"max_tokens":8}`, model)
+}
+
+func callE2ELiteLLMModel(state *RootState, lab, apiKey, orch, model string) (string, error) {
+	endpoint, body := e2eModelRequest(orch, model)
+	req, err := http.NewRequest(http.MethodPost, state.proxyRuntime().BaseURL()+endpoint, strings.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 	req.Host = labLiteLLMHost(lab)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("x-litellm-api-key", "Bearer "+apiKey)
 	req.Header.Set("x-litellm-agent-id", "taxiway-e2e")
-
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -1247,40 +3590,20 @@ func callE2ELiteLLMChatCompletion(state *RootState, lab, apiKey, model string) (
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("LiteLLM returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
-	var parsed struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", err
-	}
-	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("LiteLLM response has no choices: %s", string(data))
-	}
-	return parsed.Choices[0].Message.Content, nil
+	return e2eModelResponseText(orch, model, data)
 }
 
-func callE2ELiteLLMChatCompletionFromLab(state *RootState, ref config.LabRef, apiKey, model string) (string, error) {
-	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"smoke"}],"max_tokens":8}`, model)
+func callE2ELiteLLMModelFromLab(state *RootState, ref config.LabRef, apiKey, model string) (string, error) {
+	endpoint, body := e2eModelRequest(ref.Orch, model)
 	var stdout, stderr bytes.Buffer
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	result, err := state.Driver.Exec(ctx, idName(ref.Lab), driver.ExecRequest{
 		Workdir: "/lab/work",
-		Argv: []string{
-			"curl", "-fsS", "--max-time", "10",
-			"-H", "Content-Type: application/json",
-			"-H", "Authorization: Bearer " + apiKey,
-			"-H", "x-litellm-api-key: Bearer " + apiKey,
-			"-H", "x-litellm-agent-id: taxiway-e2e",
-			"--data", body,
-			labLiteLLMBaseURL(state, ref) + "/v1/chat/completions",
-		},
-		Stdout: &stdout,
-		Stderr: &stderr,
+		Argv: []string{"curl", "-fsS", "--max-time", "15",
+			"-H", "Content-Type: application/json", "-H", "x-litellm-api-key: Bearer " + apiKey,
+			"-H", "x-litellm-agent-id: taxiway-e2e", "--data", body, labLiteLLMBaseURL(state, ref) + endpoint},
+		Stdout: &stdout, Stderr: &stderr,
 	})
 	if err != nil {
 		return "", err
@@ -1288,21 +3611,51 @@ func callE2ELiteLLMChatCompletionFromLab(state *RootState, ref config.LabRef, ap
 	if result.ExitCode != 0 {
 		return "", fmt.Errorf("lab gateway request exited %d: %s", result.ExitCode, strings.TrimSpace(stderr.String()))
 	}
+	return e2eModelResponseText(ref.Orch, model, stdout.Bytes())
+}
 
-	var parsed struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+func e2eModelResponseText(orch, model string, data []byte) (string, error) {
+	if orch == "codex" {
+		for _, line := range strings.Split(string(data), "\n") {
+			if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+				continue
+			}
+			var event struct {
+				Type     string `json:"type"`
+				Response struct {
+					Model  string `json:"model"`
+					Status string `json:"status"`
+					Output []struct {
+						Content []struct {
+							Text string `json:"text"`
+						} `json:"content"`
+					} `json:"output"`
+				} `json:"response"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+				return "", err
+			}
+			if event.Type == "response.completed" && event.Response.Model == model && event.Response.Status == "completed" && len(event.Response.Output) > 0 && len(event.Response.Output[0].Content) > 0 {
+				return event.Response.Output[0].Content[0].Text, nil
+			}
+		}
+		return "", fmt.Errorf("Codex stream did not complete for model %s", model)
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
+	var message struct {
+		Model      string `json:"model"`
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(data, &message); err != nil {
 		return "", err
 	}
-	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("LiteLLM response has no choices: %s", stdout.String())
+	if message.Model != model || message.StopReason != "end_turn" || len(message.Content) == 0 || message.Content[0].Type != "text" {
+		return "", fmt.Errorf("Anthropic message did not complete for model %s", model)
 	}
-	return parsed.Choices[0].Message.Content, nil
+	return message.Content[0].Text, nil
 }
 
 func collectE2ELiteLLMDiagnostics(t *testing.T, state *RootState, ref config.LabRef, fakeUpstreamBaseURL string) string {
@@ -1398,6 +3751,106 @@ func assertE2EObservabilityTraceIngested(t *testing.T, state *RootState, lab, or
 		time.Sleep(2 * time.Second)
 	}
 	require.Failf(t, "Langfuse trace not ingested", "project_id=%s last_count=%q", projectID, last)
+}
+
+// LiteLLM prices calls from the cost map it loaded at startup: the one
+// downloaded from GitHub, or the one bundled in the image when that download
+// fails. /model/info reports the prices the running gateway actually uses;
+// ChatGPT routes are priced as their equivalent OpenAI API model.
+func assertE2EGatewayModelsPriced(t *testing.T, state *RootState, lab, orch string) {
+	t.Helper()
+	ref := config.LabRef{Lab: lab, Orch: orch, Driver: state.Driver.Name()}
+	values, err := readLabGatewayEnv(config.StateDir(state.Flags.StateDir, state.RepoDir), ref)
+	require.NoError(t, err)
+	apiKey := values[labLiteLLMAPIKeyEnv]
+	require.NotEmpty(t, apiKey)
+
+	var data []byte
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		data, err = getE2ELiteLLMModelInfo(state, lab, apiKey)
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	require.NoError(t, err)
+	var info struct {
+		Data []struct {
+			ModelName string `json:"model_name"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(data, &info))
+	var exposed []string
+	for _, model := range info.Data {
+		exposed = append(exposed, model.ModelName)
+	}
+	require.Subset(t, exposed, e2eGatewayModelNames(t, orch))
+	unpriced, err := unpricedLiteLLMModels(data)
+	require.NoError(t, err)
+	require.Empty(t, unpriced, "lab gateway has no non-zero input/output price for these models")
+}
+
+func getE2ELiteLLMModelInfo(state *RootState, lab, apiKey string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, state.proxyRuntime().BaseURL()+"/model/info", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = labLiteLLMHost(lab)
+	req.Header.Set("x-litellm-api-key", "Bearer "+apiKey)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("LiteLLM /model/info returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
+	}
+	return data, nil
+}
+
+// LiteLLM exports its computed cost as llm.cost.total. Langfuse must record it
+// as the provided cost rather than infer one from its own model price table.
+func assertE2EGenerationCostProvided(t *testing.T, state *RootState, lab, orch string) {
+	t.Helper()
+	ref := config.LabRef{Lab: lab, Orch: orch, Driver: state.Driver.Name()}
+	values, err := readLabGatewayEnv(config.StateDir(state.Flags.StateDir, state.RepoDir), ref)
+	require.NoError(t, err)
+	projectID := values[labLangfuseProjectIDEnv]
+	require.NotEmpty(t, projectID)
+
+	query := fmt.Sprintf("SELECT DISTINCT provided_model_name FROM observations WHERE project_id = '%s' "+
+		"AND type = 'GENERATION' AND provided_cost_details['total'] > 0 FORMAT TSV", strings.ReplaceAll(projectID, "'", "''"))
+	costed := e2eGatewayModelNames(t, orch)
+	var missing []string
+	var last string
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		out, err := exec.Command("docker", "exec", state.observabilityRuntime().ClickHouseContainer(), "clickhouse-client", "--query", query).CombinedOutput()
+		last = strings.TrimSpace(string(out))
+		priced := map[string]bool{}
+		if err == nil {
+			for _, name := range strings.Fields(last) {
+				priced[name] = true
+			}
+		}
+		missing = missing[:0]
+		for _, name := range costed {
+			if !priced[name] {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	sort.Strings(missing)
+	require.Empty(t, missing, "Langfuse generations without a provided non-zero cost; project_id=%s last=%q", projectID, last)
 }
 
 func assertE2EPhase(t *testing.T, stateDir, id string, phase phases.Phase) {

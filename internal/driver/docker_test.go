@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,9 +24,11 @@ func TestNormaliseDockerState(t *testing.T) {
 		{"running", "running"},
 		{"exited", "stopped"},
 		{"created", "stopped"}, // container stuck at docker run (never started)
-		{"paused", "paused"},
-		{"dead", "dead"},
-		{"", ""},
+		{"paused", "stopped"},
+		{"dead", "stopped"},
+		{"restarting", "stopped"},
+		{"removing", "stopped"},
+		{"", "stopped"},
 	}
 	for _, tc := range cases {
 		got := normaliseDockerState(tc.in)
@@ -37,6 +40,7 @@ func TestNormaliseDockerState(t *testing.T) {
 // have a completed created_at sidecar (i.e. Create finished successfully)
 // and that entries without the sidecar are silently skipped.
 func TestDockerList_SidecarGating(t *testing.T) {
+	installFakeDocker(t, "#!/bin/sh\necho 'Error: No such object: taxiway-complete' >&2\nexit 1\n")
 	t.Setenv("TAXIWAY_CONTEXT", "")
 	t.Setenv("TAXIWAY_CONTEXT_ID", "")
 
@@ -115,7 +119,7 @@ exit 0
 	lines := readCommandLog(t, logPath)
 	require.Equal(t, []string{
 		"volume create taxiway-taxiway-demo-lab",
-		"run -d --name taxiway-demo --add-host demo.litellm.internal:host-gateway -e USER=taxiway -e HOME=/home/taxiway -e SHELL=/bin/bash -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e LC_CTYPE=C.UTF-8 -e TERM=xterm-256color -v taxiway-taxiway-demo-lab:/lab -v " + repoDir + "/infra:/lab/infra:ro -v " + repoDir + "/agents:/lab/agents:ro -v " + repoDir + "/orchestrators/gastown:/lab/orchestrators/gastown:ro -v " + gitDir + ":/lab/git -v " + recordingsDir + ":/lab/recordings ubuntu:test sleep infinity",
+		"run -d --init --name taxiway-demo --add-host demo.litellm.internal:host-gateway -e USER=taxiway -e HOME=/home/taxiway -e SHELL=/bin/bash -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e LC_CTYPE=C.UTF-8 -e TERM=xterm-256color -v taxiway-taxiway-demo-lab:/lab -v " + repoDir + "/infra:/lab/infra:ro -v " + repoDir + "/agents:/lab/agents:ro -v " + repoDir + "/orchestrators/gastown:/lab/orchestrators/gastown:ro -v " + gitDir + ":/lab/git -v " + recordingsDir + ":/lab/recordings ubuntu:test sleep infinity",
 		"exec taxiway-demo apt-get update -qq",
 		"exec taxiway-demo apt-get install -y -qq sudo",
 		"exec taxiway-demo sh -c id -u 'taxiway' >/dev/null 2>&1 || useradd -m -s '/bin/bash' 'taxiway' && usermod -aG sudo 'taxiway' && printf '%s\\n' 'taxiway ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/taxiway-taxiway && chmod 0440 /etc/sudoers.d/taxiway-taxiway && mkdir -p /lab/work /lab/git /lab/recordings && chown -R 'taxiway:taxiway' /lab/work /lab/git /lab/recordings",
@@ -125,6 +129,53 @@ exit 0
 	require.FileExists(t, filepath.Join(stateDir, "demo", "created_at"))
 	require.DirExists(t, gitDir)
 	require.DirExists(t, recordingsDir)
+	// Full Access stops at the configured guest/mount boundary.
+	require.NotContains(t, lines[1], "--privileged")
+	require.NotContains(t, lines[1], "docker.sock")
+	require.NotContains(t, lines[1], ":/home/taxiway")
+	require.NotContains(t, lines[1], ":/lab/work")
+}
+
+func TestDockerRunArgsRunsAnInitAsPID1(t *testing.T) {
+	args := dockerRunArgs("taxiway-demo", "taxiway-demo-lab", CreateOptions{
+		Lab: "demo", Orch: "gascity", RepoDir: "/repo", GitDir: "/git", RecordingsDir: "/recordings",
+	}, "ubuntu:test")
+
+	// The init reaps orphaned guest processes; the image command stays the keep-alive.
+	require.Equal(t, []string{"run", "-d", "--init"}, args[:3])
+	require.Equal(t, []string{"ubuntu:test", "sleep", "infinity"}, args[len(args)-3:])
+}
+
+func TestDockerSystemctlStubRejectsUserManagerAndAcceptsSystemCalls(t *testing.T) {
+	stub := filepath.Join(t.TempDir(), "systemctl")
+	require.NoError(t, os.WriteFile(stub, []byte(dockerSystemctlStub), 0o755))
+	run := func(args ...string) (int, string, string) {
+		var stdout, stderr bytes.Buffer
+		cmd := exec.Command(stub, args...)
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		code := 0
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			code = exitErr.ExitCode()
+		} else {
+			require.NoError(t, err)
+		}
+		return code, stdout.String(), stderr.String()
+	}
+
+	// get.docker.com enables the daemon through the system manager.
+	code, stdout, stderr := run("enable", "--now", "docker")
+	require.Zero(t, code)
+	require.Empty(t, stdout)
+	require.Contains(t, stderr, "[docker-shim] systemctl enable --now docker")
+
+	// Probes for a per-user manager must not see a fake one.
+	for _, args := range [][]string{{"--user", "show-environment"}, {"is-active", "--user", "--quiet", "gascity-supervisor.service"}} {
+		code, stdout, stderr = run(args...)
+		require.Equal(t, 1, code, args)
+		require.Empty(t, stdout, args)
+		require.Contains(t, stderr, "[docker-shim] no systemd user manager in container", args)
+	}
 }
 
 func TestDockerRunArgsInjectsUtf8TerminalEnvironment(t *testing.T) {
@@ -269,8 +320,9 @@ exit 1
 	require.False(t, status.Created.IsZero())
 }
 
-func TestDockerInspectFailuresMeanAbsent(t *testing.T) {
+func TestDockerMissingInspectionMeansAbsent(t *testing.T) {
 	installFakeDocker(t, `#!/bin/sh
+echo 'Error: No such object: taxiway-missing' >&2
 exit 1
 `)
 	d := NewDockerDriver(t.TempDir())
@@ -347,4 +399,14 @@ func readCommandLog(t *testing.T, logPath string) []string {
 	raw, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	return strings.Split(strings.TrimSpace(string(raw)), "\n")
+}
+
+func TestDockerRunningPropagatesInspectionFailure(t *testing.T) {
+	installFakeDocker(t, `#!/bin/sh
+ echo 'Cannot connect to the Docker daemon' >&2
+ exit 1
+ `)
+	running, err := NewDockerDriver(t.TempDir()).Running(context.Background(), "taxiway-demo")
+	require.Error(t, err)
+	require.False(t, running)
 }

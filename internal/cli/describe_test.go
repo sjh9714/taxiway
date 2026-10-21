@@ -28,6 +28,44 @@ settings:
 	require.Contains(t, out, "--set version=1.1.0")
 }
 
+func TestDescribeClaudeMCPOrchestratorSettings(t *testing.T) {
+	for _, orch := range []string{"claude-code", "gastown"} {
+		t.Run(orch, func(t *testing.T) {
+			root, state, _, stdout, stderr := buildUpTestRoot(t)
+			var err error
+			state.RepoDir, err = filepath.Abs(filepath.Join("..", ".."))
+			require.NoError(t, err)
+			out, _, err := execUpRoot(t, root, stdout, stderr, "describe", orch)
+			require.NoError(t, err)
+			require.Contains(t, out, "--set tool-search=true")
+			require.Contains(t, out, "Default: true")
+			require.Contains(t, out, "--set claudeai-mcp-servers=false")
+			require.Contains(t, out, "\n    Default: false\n")
+			require.NotContains(t, out, "--set claude-code.")
+		})
+	}
+}
+
+func TestDescribeAgentVersionSettings(t *testing.T) {
+	for orch, setting := range map[string]string{
+		"claude-code": "claude-code-version",
+		"gastown":     "claude-code-version",
+		"codex":       "codex-version",
+	} {
+		t.Run(orch, func(t *testing.T) {
+			root, state, _, stdout, stderr := buildUpTestRoot(t)
+			var err error
+			state.RepoDir, err = filepath.Abs(filepath.Join("..", ".."))
+			require.NoError(t, err)
+			out, _, err := execUpRoot(t, root, stdout, stderr, "describe", orch)
+			require.NoError(t, err)
+			require.Contains(t, out, "\n  "+setting+"\n")
+			require.Contains(t, out, "--set "+setting+"=latest")
+			require.Contains(t, out, "Phases: install, start")
+		})
+	}
+}
+
 func TestDescribeWithoutSettingsShowsNone(t *testing.T) {
 	root, state, _, stdout, stderr := buildUpTestRoot(t)
 	setManifest(t, state, "gastown", "name: gastown\ndescription: Gas Town\n")
@@ -49,6 +87,7 @@ settings:
   - name: model
     description: Full Claude Code model name
     default: claude-opus-4-8
+    examples: [claude-opus-4-8]
     phases: [start]
 `)
 	writeAgentManifest(t, state, "claude-code", `name: claude-code
@@ -77,6 +116,19 @@ litellm:
 	require.Contains(t, out, "  claude-sonnet-4-6")
 	require.NotContains(t, out, "gpt-5.5")
 	require.Contains(t, out, "Examples:")
-	require.Contains(t, out, "  --set model=claude-sonnet-4-6")
-	require.NotContains(t, out, "  --set model=claude-opus-4-8")
+	require.NotContains(t, out, "  --set model=claude-sonnet-4-6")
+	require.Contains(t, out, "  --set model=claude-opus-4-8")
+
+	// A catalog must not invent examples when the manifest declares none.
+	setManifest(t, state, "claude-code", `name: claude-code
+agents: [claude-code]
+settings:
+  - name: model
+    default: claude-opus-4-8
+`)
+	out, _, err = execUpRoot(t, root, stdout, stderr, "describe", "claude-code")
+	require.NoError(t, err)
+	require.NotContains(t, out, "Examples:")
+	require.Contains(t, out, "Available LiteLLM models:")
+	require.Contains(t, out, "  claude-sonnet-4-6")
 }

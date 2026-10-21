@@ -1,8 +1,8 @@
 # Gas Town
 
-The `gastown` adapter provisions [gastownhall/gastown](https://gastownhall.ai)
-with a workspace shell. The adapter provisions Claude Code as the agent CLI
-inside the lab.
+The `gastown` adapter provisions
+[Gas Town](https://github.com/gastownhall/gastown) with a workspace shell. The
+adapter provisions Claude Code as the agent CLI inside the lab.
 
 ## Quick Start
 
@@ -39,6 +39,10 @@ The preset passes this root as a launcher argument so it survives `gt handoff`.
 On every launch, including handoff, the launcher reloads the managed Lab gateway
 configuration from `~/.config/taxiway/env`. Gateway credentials are not placed
 in command arguments, and missing gateway configuration stops the launch.
+The launcher also reloads the selected Claude authentication mode. In
+`auth_mode=api-key`, every role and handoff receives the gateway key as the
+native `ANTHROPIC_AUTH_TOKEN` credential. Subscription mode clears that managed
+override and uses the saved native OAuth login.
 This does not change Codex configuration or other Claude permission dialogs.
 
 ## Settings
@@ -47,15 +51,30 @@ The adapter exposes these settings through `--set`:
 
 | Setting | Description | Default |
 |---|---|---|
-| `version` | Gas Town version or tag to install from release archive | `latest` |
+| `version` | Gas Town release version or tag to install | `latest` |
 | `beads-version` | [Beads](https://github.com/gastownhall/beads) (Gas Town's Git-backed work-tracking unit) version override; omitted uses the Gas Town compatibility matrix | Adapter default |
-| `model` | Claude Code model name passed through LiteLLM | `claude-opus-4-8` |
+| `claude-code-version` | Claude Code CLI release used by Gas Town agents: `latest` or an exact release; distinct from `version` | `latest` |
+| `model` | Claude Code model name passed through LiteLLM | `claude-opus-5-5` |
+| `tool-search` | Load MCP tool definitions on demand: `true`, `false`, `auto`, or `auto:N` | `true` |
+| `claudeai-mcp-servers` | Import Claude.ai connectors: `true` or `false` | `false` |
+
+Settings persist with the lab; `--clear-set` restores the default. MCP settings
+apply at each agent launch, including handoffs. Already running agents must
+restart or handoff to pick up changes. See [Claude Code settings](claude-code.md#settings)
+for connector examples and [Agent Version](claude-code.md#agent-version) for
+`claude-code-version`.
 
 Example:
 
 ```bash
-taxiway up mylab --type gastown --set version=1.1.0 --set model=claude-sonnet-4-6
+taxiway up mylab --type gastown --set version=1.2.1 --set model=claude-sonnet-5-5
 ```
+
+For Gas Town 1.2.1, Taxiway builds the pinned release source with the
+[upstream self-sling correction](https://github.com/gastownhall/gastown/pull/4050).
+This lets Deacon attach its initial patrol without interrupting its own Claude
+session. The first installation downloads a verified Go toolchain and builds
+`gt`; its version identifies the backport as `1.2.1-taxiway-self-sling-4050`.
 
 ## Shell Behavior
 
@@ -107,3 +126,11 @@ post-sanitization collision.
 ```bash
 taxiway describe gastown
 ```
+
+## Autonomous permissions
+
+Gas Town requires YOLO/bypass for every automated role. Taxiway preserves
+`--dangerously-skip-permissions` during daemon launches and handoffs;
+this adapter does not offer a restrictive permission mode.
+
+See [guest capabilities](../contributing/live-tests.md#guest-capabilities).

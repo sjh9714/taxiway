@@ -7,8 +7,11 @@
 
 set -euo pipefail
 
+
 # shellcheck source=../../infra/trace/events.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../infra/trace/events.sh" 2>/dev/null || true
+# shellcheck source=../../infra/commands/steps.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../infra/commands/steps.sh"
 
 if [ -f "${HOME}/.config/taxiway/env" ]; then
     set -a
@@ -17,16 +20,41 @@ if [ -f "${HOME}/.config/taxiway/env" ]; then
     set +a
 fi
 
-lab_emit_event phase start
-
+# shellcheck source=../../agents/codex/env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../agents/codex/env.sh"
 log()  { printf '\n\033[1;34m[codex-start]\033[0m %s\n' "$*"; }
 pass() { printf '  \033[1;32mOK\033[0m   %s\n' "$*"; }
 
 SESSION="codex"
-CODEX_MODEL="${TAXIWAY_SET_MODEL:-gpt-5.5}"
+CODEX_MODEL="${TAXIWAY_SET_MODEL:?Missing model: start this orchestrator through Taxiway}"
 TAXIWAY_LITELLM_BASE_URL="${TAXIWAY_LITELLM_BASE_URL:-http://${TAXIWAY_LAB:-lab}.litellm.internal:4000}"
 TAXIWAY_LITELLM_OPENAI_BASE_URL="${TAXIWAY_LITELLM_BASE_URL%/}/v1"
 TAXIWAY_LITELLM_AGENT_ID="${TAXIWAY_LITELLM_AGENT_ID:-${TAXIWAY_AGENT:-codex}}"
+
+if taxiway_is_plan; then
+    log "Configuring Codex for the Taxiway LiteLLM gateway"
+    taxiway_plan_detail "model: $CODEX_MODEL"
+    taxiway_plan_detail "base URL: $TAXIWAY_LITELLM_OPENAI_BASE_URL"
+    if [[ -n "${TAXIWAY_LITELLM_API_KEY:-}" ]]; then
+        taxiway_plan_detail "LiteLLM gateway key is available"
+    else
+        taxiway_plan_detail "LiteLLM gateway key is missing"
+    fi
+    if taxiway_can_inspect && tmux has-session -t "$SESSION" 2>/dev/null; then
+        log "Stopping existing tmux session '$SESSION'"
+    fi
+    log "Starting tmux session '$SESSION'"
+    taxiway_plan_detail "codex resume --last --dangerously-bypass-approvals-and-sandbox || codex --dangerously-bypass-approvals-and-sandbox"
+    exit 0
+fi
+
+lab_emit_event phase start
+
+if [[ -n "${TAXIWAY_SET_CODEX_VERSION:-}" && "$TAXIWAY_SET_CODEX_VERSION" != latest ]]; then
+    source "$(dirname "${BASH_SOURCE[0]}")/../../infra/agents/npm-agent.sh"
+    npm_agent_verify_version codex codex-version "$TAXIWAY_SET_CODEX_VERSION" "$(codex --version | awk 'NR == 1 { print $NF }')" "$(command -v codex)"
+fi
+
 
 # Use TAXIWAY_WORKSPACE_DIR as the working directory if set and exists.
 # Without a cloned repo, start in /lab/work rather than $HOME so the session
@@ -55,19 +83,29 @@ pass "LiteLLM gateway key found"
 log "LiteLLM provider"
 mkdir -p "${HOME}/.codex"
 CODEX_CONFIG="${HOME}/.codex/config.toml"
+# This adapter owns the autonomous default; native settings also cover children.
+# shellcheck source=../../agents/codex/permissions.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../agents/codex/permissions.sh"
 tmp_config="$(mktemp)"
 {
+    codex_autonomous_config
     printf 'model_provider = "taxiway-litellm"\n'
     printf 'model = "%s"\n' "$CODEX_MODEL"
+    codex_update_policy_config "${TAXIWAY_SET_CODEX_VERSION:-latest}"
+    codex_gateway_model_catalog
     printf '\n'
 } > "$tmp_config"
 if [ -f "$CODEX_CONFIG" ]; then
     awk '
         /^\[model_providers\.taxiway-litellm\]$/ { skip=1; next }
-        /^\[/ { skip=0 }
+        /^\[/ { skip=0; top=1 }
         skip { next }
         /^model_provider = / { next }
         /^model = / { next }
+        !top && /^model_catalog_json = / { next }
+        !top && /^check_for_update_on_startup = / { next }
+        /^approval_policy = / { next }
+        /^sandbox_mode = / { next }
         { print }
     ' "$CODEX_CONFIG" >> "$tmp_config"
 fi
@@ -99,7 +137,9 @@ do
         tmux_env_args+=(-e "${name}=${!name}")
     fi
 done
-agent_cmd="codex resume --last || codex"
+# Explicit flags also override a resumed session's saved permission settings.
+printf -v agent_cmd 'codex resume --last %q || codex %q' \
+    "${codex_autonomous_args[@]}" "${codex_autonomous_args[@]}"
 tmux new-session -d -s "$SESSION" -c "$start_dir" "${tmux_env_args[@]}" "$agent_cmd"
 pass "Codex started in tmux session '$SESSION'"
 printf '  Attach with: taxiway shell codex\n'

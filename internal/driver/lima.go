@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,11 +26,13 @@ func NewLimaDriver(stateDir string) *LimaDriver { return &LimaDriver{stateDir: s
 
 func (l *LimaDriver) Name() string { return "lima" }
 
-func (l *LimaDriver) Exists(_ context.Context, id string) (bool, error) {
-	out, err := exec.Command("limactl", "list", "--format={{.Name}}").Output()
+// GuestKind reports a VM guest with its own init and systemd.
+func (l *LimaDriver) GuestKind() string { return GuestKindVM }
+
+func (l *LimaDriver) Exists(ctx context.Context, id string) (bool, error) {
+	out, err := exec.CommandContext(ctx, "limactl", "list", "--format={{.Name}}").Output()
 	if err != nil {
-		slog.Debug("limactl list error", "err", err)
-		return false, nil // limactl may error if no labs exist yet
+		return false, inspectionError("limactl list", err)
 	}
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
@@ -43,13 +44,9 @@ func (l *LimaDriver) Exists(_ context.Context, id string) (bool, error) {
 }
 
 func (l *LimaDriver) Running(ctx context.Context, id string) (bool, error) {
-	exists, err := l.Exists(ctx, id)
-	if !exists || err != nil {
-		return false, err
-	}
-	out, err := exec.Command("limactl", "list", "--format={{.Name}} {{.Status}}").Output()
+	out, err := exec.CommandContext(ctx, "limactl", "list", "--format={{.Name}} {{.Status}}").Output()
 	if err != nil {
-		return false, err
+		return false, inspectionError("limactl list", err)
 	}
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
@@ -112,18 +109,12 @@ func (l *LimaDriver) Create(ctx context.Context, id string, opts CreateOptions) 
 	if err := l.startInstance(ctx, id, "--name="+id, yamlPath); err != nil {
 		return err
 	}
-	if err := l.prepareInternalDirs(ctx, id); err != nil {
-		return err
-	}
 	_ = config.EnsureCreatedAt(l.stateDir, id)
 	return nil
 }
 
 func (l *LimaDriver) Start(ctx context.Context, id string) error {
-	if err := l.startInstance(ctx, id, id); err != nil {
-		return err
-	}
-	return l.prepareInternalDirs(ctx, id)
+	return l.startInstance(ctx, id, id)
 }
 
 // startInstance applies the same startup policy on every host, for both new
@@ -143,24 +134,57 @@ func (l *LimaDriver) startInstance(ctx context.Context, id string, args ...strin
 	cmd := exec.CommandContext(ctx, "limactl", append([]string{"start", "--timeout=" + timeout.String()}, args...)...)
 	// Do not wait forever for output pipes inherited by Lima subprocesses.
 	cmd.WaitDelay = time.Second
-	out, err := cmd.CombinedOutput()
+	output := limaStartupOutput{stage: "not reported"}
+	stream := io.MultiWriter(os.Stderr, &output)
+	cmd.Stdout, cmd.Stderr = stream, stream
+	err := cmd.Run()
 	if err == nil {
-		return nil
+		return l.prepareInternalDirs(ctx, id)
 	}
 	if ctx.Err() != nil {
 		err = ctx.Err()
 	}
-	return fmt.Errorf("lima: start %s (timeout %s): %w\n%s\nInspect the instance with: limactl list", id, timeout, err, strings.TrimSpace(string(out)))
+	return fmt.Errorf("lima: start %s (timeout %s, last readiness stage: %s): %w\n%s\nInspect the instance with: limactl list %s", id, timeout, output.stage, err, strings.TrimSpace(string(output.tail)), id)
 }
 
-func (l *LimaDriver) Stop(_ context.Context, id string) error {
-	return exec.Command("limactl", "stop", id).Run()
+// Retain bounded failure context while forwarding native progress immediately.
+type limaStartupOutput struct {
+	tail  []byte
+	stage string
+	line  []byte
+}
+
+func (o *limaStartupOutput) Write(p []byte) (int, error) {
+	const limit = 16 * 1024
+	if len(p) >= limit {
+		o.tail = append(o.tail[:0], p[len(p)-limit:]...)
+	} else {
+		o.tail = append(o.tail, p...)
+		if len(o.tail) > limit {
+			o.tail = o.tail[len(o.tail)-limit:]
+		}
+	}
+	for _, b := range p {
+		if b == '\n' {
+			if strings.Contains(string(o.line), "Waiting for") {
+				o.stage = string(o.line)
+			}
+			o.line = o.line[:0]
+		} else if len(o.line) < 512 {
+			o.line = append(o.line, b)
+		}
+	}
+	return len(p), nil
+}
+
+func (l *LimaDriver) Stop(ctx context.Context, id string) error {
+	return limaOperation(ctx, "stop", id)
 }
 
 // Delete stops, deletes the lima lab, and removes all on-disk state for the lab
 // (rendered YAML, work dirs, phase markers, events.jsonl).
-func (l *LimaDriver) Delete(_ context.Context, id string) error {
-	if err := exec.Command("limactl", "delete", "--force", id).Run(); err != nil {
+func (l *LimaDriver) Delete(ctx context.Context, id string) error {
+	if err := limaOperation(ctx, "delete", "--force", id); err != nil {
 		return err
 	}
 	// Remove the entire lab state directory so work/, phases/, agent-lab.yaml, etc.
@@ -180,7 +204,10 @@ func (l *LimaDriver) Status(ctx context.Context, id string) (Status, error) {
 	if !exists {
 		return Status{Name: id, State: "absent", Driver: "lima"}, nil
 	}
-	running, _ := l.Running(ctx, id)
+	running, err := l.Running(ctx, id)
+	if err != nil {
+		return Status{}, err
+	}
 	state := "stopped"
 	if running {
 		state = "running"
@@ -192,11 +219,10 @@ func (l *LimaDriver) Status(ctx context.Context, id string) (Status, error) {
 	return st, nil
 }
 
-func (l *LimaDriver) List(_ context.Context) ([]Status, error) {
-	out, err := exec.Command("limactl", "list", "--format={{.Name}} {{.Status}}").Output()
+func (l *LimaDriver) List(ctx context.Context) ([]Status, error) {
+	out, err := exec.CommandContext(ctx, "limactl", "list", "--format={{.Name}} {{.Status}}").Output()
 	if err != nil {
-		slog.Debug("limactl list error", "err", err)
-		return nil, nil
+		return nil, inspectionError("limactl list", err)
 	}
 	var result []Status
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
@@ -224,8 +250,16 @@ func (l *LimaDriver) List(_ context.Context) ([]Status, error) {
 
 // Copy copies a local file to the lab at the given destination path.
 // It uses `limactl copy <srcHost> <id>:<dstLab>`.
-func (l *LimaDriver) Copy(_ context.Context, id, srcHost, dstlab string) error {
-	return exec.Command("limactl", "copy", srcHost, id+":"+dstlab).Run()
+func (l *LimaDriver) Copy(ctx context.Context, id, srcHost, dstlab string) error {
+	return limaOperation(ctx, "copy", srcHost, id+":"+dstlab)
+}
+
+func limaOperation(ctx context.Context, args ...string) error {
+	out, err := exec.CommandContext(ctx, "limactl", args...).CombinedOutput()
+	if err != nil {
+		return toolOutputError("limactl "+args[0], err, out)
+	}
+	return nil
 }
 
 // Shell opens an interactive shell in the lab at /lab (the lab repo root).
@@ -353,8 +387,12 @@ func (l *LimaDriver) Exec(ctx context.Context, id string, req ExecRequest) (Exec
 
 func (l *LimaDriver) prepareInternalDirs(ctx context.Context, id string) error {
 	cmd := exec.CommandContext(ctx, "limactl", "shell", "--workdir=/", id, "--", "sh", "-c",
-		`sudo mkdir -p /lab/work && sudo chown "$(id -u):$(id -g)" /lab/work`)
+		`test -s /run/lima-boot-done || { printf 'Lima boot scripts have not finished\n' >&2; exit 1; }; sudo mkdir -p /lab/work && sudo chown "$(id -u):$(id -g)" /lab/work`)
+	cmd.WaitDelay = time.Second
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		return fmt.Errorf("lima: prepare internal dirs for %s: %w\n%s", id, err, out)
 	}
 	return nil

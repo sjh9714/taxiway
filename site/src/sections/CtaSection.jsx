@@ -45,6 +45,7 @@ function Footer() {
       { label: 'Claude Code', to: '/docs/orchestrators/claude-code' },
       { label: 'Codex', to: '/docs/orchestrators/codex' },
       { label: 'Gas Town', to: '/docs/orchestrators/gastown' },
+      { label: 'Gas City', to: '/docs/orchestrators/gascity' },
     ]},
     { h: 'Documentation', links: [
       { label: 'Overview', to: '/docs' },
@@ -67,6 +68,10 @@ function Footer() {
             </div>
             <p style={{ fontSize: 'var(--text-sm)', color: 'var(--tw-muted)', maxWidth: 240 }}>
               Isolated labs for running and comparing agent orchestrators.
+            </p>
+            <p style={{ fontSize: 'var(--text-sm)', color: 'var(--tw-muted)', maxWidth: 240, marginTop: 10 }}>
+              Taxiway is maintained with AI agents, under human review:{' '}
+              <Link to="/docs/contributing/agentic-system" style={{ fontSize: 'var(--text-sm)', color: 'var(--tw-muted)', textDecoration: 'none' }}>see how</Link>.
             </p>
           </div>
           {cols.map(c => (

@@ -4,12 +4,34 @@
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/../../infra/trace/events.sh" 2>/dev/null || true
-
-lab_emit_event phase start
+# shellcheck source=../../infra/commands/steps.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../infra/commands/steps.sh"
+# shellcheck source=../../infra/agents/npm-agent.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../infra/agents/npm-agent.sh"
 
 log()  { printf '\n\033[1;34m[claude-code-agent-verify]\033[0m %s\n' "$*"; }
 pass() { printf '  \033[1;32mOK\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
+
+if taxiway_is_plan; then
+  log "Verifying claude binary"
+  if taxiway_can_inspect; then
+    if command -v claude >/dev/null 2>&1; then
+      taxiway_plan_detail "claude is present"
+    else
+      taxiway_plan_detail "claude is missing"
+    fi
+  else
+    taxiway_plan_detail "claude"
+  fi
+  log "Verifying claude version, help, and auth status"
+  taxiway_plan_detail "claude --version"
+  taxiway_plan_detail "claude --help"
+  taxiway_plan_detail "Claude configuration and credentials"
+  exit 0
+fi
+
+lab_emit_event phase start
 
 CLAUDE="$(command -v claude || true)"
 [ -n "$CLAUDE" ] || fail "claude not found - run: taxiway install <lab>"
@@ -21,6 +43,7 @@ log "claude --version"
 cc_version="$(mktemp -t cc-version.XXXXXX)"
 "$CLAUDE" --version >"$cc_version" 2>&1 || { cat "$cc_version" >&2; rm -f "$cc_version"; fail "claude --version failed"; }
 pass "$(tr '\n' ' ' <"$cc_version")"
+npm_agent_verify_version claude-code claude-code-version "${TAXIWAY_SET_CLAUDE_CODE_VERSION:-latest}" "$(awk 'NR == 1 { print $1 }' "$cc_version")" "$CLAUDE"
 rm -f "$cc_version"
 
 log "claude --help"

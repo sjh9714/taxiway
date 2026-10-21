@@ -12,6 +12,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -53,6 +54,9 @@ func NewDockerDriver(stateDir string) *DockerDriver {
 
 func (d *DockerDriver) Name() string { return "docker" }
 
+// GuestKind reports a container guest: an init as PID 1 and no systemd.
+func (d *DockerDriver) GuestKind() string { return GuestKindContainer }
+
 // idDir returns the sidecar directory for a given lab/lab name.
 func (d *DockerDriver) idDir(id string) string {
 	return filepath.Join(d.stateDir, config.LabDirOf(id))
@@ -67,10 +71,13 @@ func dockerCmd(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 // Exists reports whether a container named id exists (regardless of state).
-func (d *DockerDriver) Exists(_ context.Context, id string) (bool, error) {
-	cmd := exec.Command("docker", "inspect", "--format={{.Name}}", id) //nolint:gosec
-	if err := cmd.Run(); err != nil {
-		return false, nil // non-zero exit = container not found
+func (d *DockerDriver) Exists(ctx context.Context, id string) (bool, error) {
+	_, err := dockerCmd(ctx, "inspect", "--format={{.Name}}", id)
+	if err != nil {
+		if dockerNotFound(err, id) {
+			return false, nil
+		}
+		return false, inspectionError("docker inspect "+id, err)
 	}
 	return true, nil
 }
@@ -79,9 +86,37 @@ func (d *DockerDriver) Exists(_ context.Context, id string) (bool, error) {
 func (d *DockerDriver) Running(ctx context.Context, id string) (bool, error) {
 	out, err := dockerCmd(ctx, "inspect", "--format={{.State.Running}}", id)
 	if err != nil {
-		return false, nil // container absent
+		if dockerNotFound(err, id) {
+			return false, nil
+		}
+		return false, inspectionError("inspect running lab "+id, err)
 	}
 	return strings.TrimSpace(string(out)) == "true", nil
+}
+
+func dockerNotFound(err error, id string) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		return false
+	}
+	message := strings.TrimSpace(string(exitErr.Stderr))
+	return strings.EqualFold(message, "Error: No such object: "+id) || strings.EqualFold(message, "Error: No such container: "+id)
+}
+
+func inspectionError(operation string, err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return toolOutputError(operation, err, exitErr.Stderr)
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func toolOutputError(operation string, err error, output []byte) error {
+	const limit = 16 * 1024
+	if len(output) > limit {
+		output = output[len(output)-limit:]
+	}
+	return fmt.Errorf("%s: %w\n%s", operation, err, strings.TrimSpace(string(output)))
 }
 
 // labVolumeName returns the canonical Docker named-volume name for a lab's /lab.
@@ -181,24 +216,26 @@ func (d *DockerDriver) Create(_ context.Context, id string, opts CreateOptions) 
 	// 5. Install container-environment shims so that bootstrap.sh and other
 	// lab scripts run identically inside Docker containers and Lima labs.
 	//
-	// Shim A — systemctl no-op stub
-	// ─────────────────────────────
+	// Shim A — systemctl stub
+	// ─────────────────────────
 	// `curl -fsSL https://get.docker.com | sh` (called by bootstrap.sh when
 	// Docker is absent) invokes `systemctl enable --now docker.service` to
 	// enable the daemon.  In a container there is no systemd init, so systemctl
-	// exits non-zero and the install script fails.  We place a no-op stub at
-	// /usr/local/bin/systemctl (higher priority than /bin/systemctl) that exits
-	// 0 for every invocation.  The stub is intentionally installed by the
-	// driver, not by bootstrap.sh, so the script itself is unchanged.
+	// exits non-zero and the install script fails.  We place a stub at
+	// /usr/local/bin/systemctl (higher priority than /bin/systemctl) that
+	// accepts those system-manager calls as no-ops.  The stub is intentionally
+	// installed by the driver, not by bootstrap.sh, so the script itself is
+	// unchanged.
 	//
-	// The stub prints a notice to stderr so runs are observable:
-	//   [docker-shim] systemctl <args> — no-op (no systemd in container)
-	// The stub is written by piping its content to `tee` inside the container
-	// so that no shell quoting or escaping of newlines is needed on the host.
-	// Double-quoted echo expands $@ so the actual arguments appear in the log.
-	systemctlStub := "#!/bin/sh\n" +
-		"echo \"[docker-shim] systemctl $@ — no-op (no systemd in container)\" >&2\n" +
-		"exit 0\n"
+	// The stub never pretends that a per-user manager exists: `systemctl
+	// --user` fails, so tools probing for one (for example a supervisor that
+	// would install a user unit) take their documented container path.
+	//
+	// The stub prints a notice to stderr so runs are observable and keeps
+	// stdout empty. It is written by piping its content to `tee` inside the
+	// container so that no shell quoting or escaping of newlines is needed on
+	// the host.
+	systemctlStub := dockerSystemctlStub
 	teeCmd := exec.Command("docker", "exec", "-i", id, "tee", "/usr/local/bin/systemctl") //nolint:gosec
 	teeCmd.Stdin = strings.NewReader(systemctlStub)
 	if out, err := teeCmd.CombinedOutput(); err != nil {
@@ -211,9 +248,26 @@ func (d *DockerDriver) Create(_ context.Context, id string, opts CreateOptions) 
 	return nil
 }
 
+// dockerSystemctlStub is installed at /usr/local/bin/systemctl in Docker labs.
+// System-manager calls are no-ops; per-user manager calls fail truthfully.
+const dockerSystemctlStub = `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "--user" ]; then
+    echo "[docker-shim] no systemd user manager in container: systemctl $*" >&2
+    exit 1
+  fi
+done
+echo "[docker-shim] systemctl $* — no-op (no systemd in container)" >&2
+exit 0
+`
+
 func dockerRunArgs(id, volName string, opts CreateOptions, image string) []string {
 	args := []string{
 		"run", "-d",
+		// The guest runs long-lived services (orchestrator supervisors and
+		// their children). Docker's init reaps orphaned processes, as PID 1
+		// does in a VM; `sleep infinity` alone would leave them as zombies.
+		"--init",
 		"--name", id,
 		"--add-host", config.LabLiteLLMInternalHost(opts.Lab) + ":host-gateway",
 		"-e", "USER=" + dockerLabUser,
@@ -279,25 +333,30 @@ func (d *DockerDriver) Delete(_ context.Context, id string) error {
 //	"exited"   → "stopped"  (container ran and exited)
 //	"created"  → "stopped"  (container was created but never started;
 //	                         semantically equivalent to stopped for callers)
-//	"paused"   → "paused"   (passed through; rare in practice)
-//	anything else → passed through unchanged
+//
+// All other present-container states map to stopped: paused, restarting,
+// removing and dead containers cannot currently execute lab commands.
+// Absence is determined by inspect's explicit not-found diagnostic.
 func normaliseDockerState(raw string) string {
 	switch raw {
-	case "exited", "created":
-		return "stopped"
+	case "running":
+		return "running"
 	default:
-		return raw
+		return "stopped"
 	}
 }
 
 // Status returns the current status of a container.
-func (d *DockerDriver) Status(_ context.Context, id string) (Status, error) {
-	out, err := exec.Command("docker", "inspect", //nolint:gosec
+func (d *DockerDriver) Status(ctx context.Context, id string) (Status, error) {
+	out, err := exec.CommandContext(ctx, "docker", "inspect", //nolint:gosec
 		"--format", "{{.State.Status}}",
 		id,
 	).Output()
 	if err != nil {
-		return Status{Name: id, State: "absent", Driver: "docker"}, nil
+		if dockerNotFound(err, id) {
+			return Status{Name: id, State: "absent", Driver: "docker"}, nil
+		}
+		return Status{}, inspectionError("docker inspect "+id, err)
 	}
 
 	state := normaliseDockerState(strings.TrimSpace(string(out)))
@@ -318,7 +377,7 @@ func (d *DockerDriver) Status(_ context.Context, id string) (Status, error) {
 // failed, docker cp failed, …) will appear in the list with state
 // "stopped"/"absent". The user can then run `taxiway rm` to clean up — Delete
 // tolerates absent containers and volumes.
-func (d *DockerDriver) List(_ context.Context) ([]Status, error) {
+func (d *DockerDriver) List(ctx context.Context) ([]Status, error) {
 	labsDir := d.stateDir
 	entries, err := os.ReadDir(labsDir)
 	if os.IsNotExist(err) {
@@ -340,13 +399,11 @@ func (d *DockerDriver) List(_ context.Context) ([]Status, error) {
 		if err != nil {
 			continue // incomplete Create — skip silently
 		}
-		id := config.RuntimeIDOf(lab)                                                          // driver id used for docker inspect
-		raw, _ := exec.Command("docker", "inspect", "--format={{.State.Status}}", id).Output() //nolint:gosec
-		state := normaliseDockerState(strings.TrimSpace(string(raw)))
-		if state == "" {
-			state = "absent"
+		id := config.RuntimeIDOf(lab)
+		st, err := d.Status(ctx, id)
+		if err != nil {
+			return nil, err
 		}
-		st := Status{Name: id, State: state, Driver: "docker"}
 		st.Created, _ = time.Parse(time.RFC3339, strings.TrimSpace(string(createdRaw)))
 		out = append(out, st)
 	}

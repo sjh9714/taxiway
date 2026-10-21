@@ -58,6 +58,9 @@ func printList(ctx context.Context, state *RootState, w io.Writer, onlyLabs ...s
 		return nil
 	}
 	printLabListTable(w, rows)
+	if len(onlyLabs) > 0 {
+		return printAgentVersions(w, stateDir, onlyLabs[0])
+	}
 	return nil
 }
 
@@ -216,7 +219,7 @@ func collectLabStatusRows(ctx context.Context, state *RootState, stateDir string
 		}
 		st, err := labStatus(ctx, stateDir, d, l.id, l.ref)
 		if err != nil {
-			st = driver.Status{Name: l.id, State: "unknown", Driver: l.ref.Driver}
+			return nil, fmt.Errorf("inspect lab %s: %w", l.ref.Lab, err)
 		}
 		rows = append(rows, statusRowFromStatus(st, l.ref, phaseLabel(stateDir, l.id)))
 	}
@@ -408,15 +411,57 @@ func driverForRef(state *RootState, ref config.LabRef) (driver.Driver, error) {
 	if err != nil {
 		return nil, err
 	}
+	if state.Flags.DryRun {
+		d = driver.NewDryRun(d)
+	}
 	return d, nil
+}
+
+func markPhase(state *RootState, stateDir, id string, phase phases.Phase) error {
+	if state.Flags.DryRun {
+		return nil
+	}
+	return phases.Mark(stateDir, id, phase)
 }
 
 // execScriptWithRef runs a script inside the lab identified by ref.
 func execScriptWithRef(ctx context.Context, state *RootState, ref config.LabRef, scriptPath string, env map[string]string) error {
-	return execScriptToWithRef(ctx, state, ref, scriptPath, os.Stdout, os.Stderr, env)
+	return execScriptToWithRefMode(ctx, state, ref, scriptPath, os.Stdout, os.Stderr, env, false)
 }
 
 func execScriptToWithRef(ctx context.Context, state *RootState, ref config.LabRef, scriptPath string, stdout, stderr io.Writer, env map[string]string) error {
+	return execScriptToWithRefMode(ctx, state, ref, scriptPath, stdout, stderr, env, false)
+}
+
+// withGuestKind returns env plus the driver's TAXIWAY_GUEST_KIND, which every
+// script run for a lab receives, whatever the caller passed.
+func withGuestKind(d driver.Driver, env map[string]string) map[string]string {
+	out := make(map[string]string, len(env)+1)
+	for key, value := range env {
+		out[key] = value
+	}
+	out["TAXIWAY_GUEST_KIND"] = d.GuestKind()
+	return out
+}
+
+func execPlannableScriptToWithRef(ctx context.Context, state *RootState, ref config.LabRef, scriptPath string, stdout, stderr io.Writer, env map[string]string) error {
+	if state.Flags.DryRun {
+		d, err := driverForRef(state, ref)
+		if err != nil {
+			return err
+		}
+		running, err := d.Running(ctx, idName(ref.Lab))
+		if err != nil {
+			return err
+		}
+		if !running {
+			return execOfflinePlanScript(ctx, scriptPath, stdout, stderr, withGuestKind(d, env))
+		}
+	}
+	return execScriptToWithRefMode(ctx, state, ref, scriptPath, stdout, stderr, env, true)
+}
+
+func execScriptToWithRefMode(ctx context.Context, state *RootState, ref config.LabRef, scriptPath string, stdout, stderr io.Writer, env map[string]string, plannable bool) error {
 	id := idName(ref.Lab)
 	stateDir := config.StateDir(state.Flags.StateDir, state.RepoDir)
 	jsonlPath := driver.EventsJSONLPath(stateDir, id)
@@ -433,6 +478,8 @@ func execScriptToWithRef(ctx context.Context, state *RootState, ref config.LabRe
 		}
 	}
 	defer closer()
+	versions := &versionSink{}
+	evSink = event.NewMultiSink(evSink, versions)
 
 	// Translate host path to lab path (e.g. <repo>/infra/commands/bootstrap.sh → /lab/infra/commands/bootstrap.sh).
 	labScript, err := hostScriptToLab(state.RepoDir, scriptPath)
@@ -447,17 +494,26 @@ func execScriptToWithRef(ctx context.Context, state *RootState, ref config.LabRe
 	// process env vars (cmd.Env) are NOT forwarded into the lab shell session
 	// by default. Passing them via `env VAR=val bash script.sh` in the argv
 	// is the portable solution that works with any SSH configuration.
+	d, err := driverForRef(state, ref)
+	if err != nil {
+		return err
+	}
 	var argv []string
-	if len(env) > 0 {
+	execEnv := withGuestKind(d, env)
+	if state.Flags.DryRun && plannable {
+		execEnv["TAXIWAY_EXECUTION_MODE"] = "plan"
+		execEnv["TAXIWAY_PLAN_INSPECTION"] = "available"
+	}
+	if len(execEnv) > 0 {
 		argv = append(argv, "env")
 		// Sort keys for deterministic ordering (important for tests and logs).
-		keys := make([]string, 0, len(env))
-		for k := range env {
+		keys := make([]string, 0, len(execEnv))
+		for k := range execEnv {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			argv = append(argv, k+"="+env[k])
+			argv = append(argv, k+"="+execEnv[k])
 		}
 	}
 	argv = append(argv, "bash", labScript)
@@ -465,22 +521,22 @@ func execScriptToWithRef(ctx context.Context, state *RootState, ref config.LabRe
 	req := driver.ExecRequest{
 		Workdir: LabRepoRoot,
 		Argv:    argv,
+		Inspect: state.Flags.DryRun && plannable,
 		Stdout:  stdout,
 		Stderr:  stderr,
 		Events:  evSink,
-		Env:     env, // still set for drivers that do forward env (e.g. mock)
+		Env:     execEnv, // still set for drivers that do forward env (e.g. mock)
 	}
 
-	d, err := driverForRef(state, ref)
-	if err != nil {
-		return err
-	}
 	res, err := d.Exec(ctx, id, req)
 	if err != nil {
 		return err
 	}
 	if res.ExitCode != 0 {
 		return fmt.Errorf("script exited with code %d", res.ExitCode)
+	}
+	if !state.Flags.DryRun {
+		return versions.persist(stateDir, id)
 	}
 	return nil
 }
@@ -543,6 +599,11 @@ func labUp(ctx context.Context, state *RootState, ref config.LabRef, logW io.Wri
 			return err
 		}
 		if running {
+			if d.Name() == "lima" {
+				// Running is the hypervisor state, not proof of SSH/provisioning readiness.
+				// Revalidate partial startup before allowing the create phase to complete.
+				return d.Start(ctx, id)
+			}
 			fmt.Fprintf(logW, "Lab %q is already running\n", ref.Lab)
 			return nil
 		}

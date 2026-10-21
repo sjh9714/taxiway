@@ -84,6 +84,7 @@ func buildUpTestRoot(t *testing.T) (*cobra.Command, *RootState, *driver.MockDriv
 	}
 	root.SetOut(&stdout)
 	root.SetErr(&stderr)
+	wrapTestDriverForDryRun(root, state)
 
 	root.AddCommand(
 		newVersionCmd(state),
@@ -200,7 +201,12 @@ func addAgentScript(t *testing.T, state *RootState, agent, script string) {
 
 func addAuthScript(t *testing.T, state *RootState, agent string) {
 	t.Helper()
-	addAgentScript(t, state, agent, "auth.sh")
+	dir := filepath.Join(state.RepoDir, "agents", agent)
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "auth.sh"),
+		[]byte("#!/bin/bash\nif [[ \"$TAXIWAY_EXECUTION_MODE\" == plan ]]; then echo '["+agent+"-auth] Checking authentication'; exit 0; fi\necho agent-auth.sh\n"), 0755,
+	))
 }
 
 func writeAgentManifest(t *testing.T, state *RootState, agent, content string) {
@@ -405,6 +411,43 @@ func TestUp_SetPersistsAndInjectsEnv(t *testing.T) {
 	}
 	require.NotNil(t, installEnv)
 	require.Equal(t, "1.1.0", installEnv["TAXIWAY_SET_VERSION"])
+}
+
+func TestInstall_ResolvesManifestDefaultsWithoutPersistingThem(t *testing.T) {
+	for _, selected := range []string{"", "explicit-model"} {
+		t.Run(selected, func(t *testing.T) {
+			root, state, mock, stdout, stderr := buildUpTestRoot(t)
+			setManifest(t, state, "gastown", `name: gastown
+settings:
+  - name: model
+    default: manifest-model
+`)
+			ref := config.LabRef{Lab: "gastown", Orch: "gastown", Driver: "mock"}
+			if selected != "" {
+				ref.Settings = map[string]string{"model": selected}
+			}
+			require.NoError(t, mock.Create(context.Background(), idName(ref.Lab), driver.CreateOptions{}))
+			require.NoError(t, mock.WriteLabRef(context.Background(), idName(ref.Lab), ref))
+			_, _, err := execUpRoot(t, root, stdout, stderr, "install", ref.Lab)
+			require.NoError(t, err)
+			want := selected
+			if want == "" {
+				want = "manifest-model"
+			}
+			found := false
+			for i, script := range mock.ExecLog {
+				if script == "install.sh" {
+					found = true
+					require.Equal(t, want, mock.ExecEnvLog[i]["TAXIWAY_SET_MODEL"])
+				}
+			}
+			require.True(t, found)
+			stored, ok, err := mock.ReadLabRef(context.Background(), idName(ref.Lab))
+			require.NoError(t, err)
+			require.True(t, ok)
+			require.Equal(t, ref.Settings, stored.Settings)
+		})
+	}
 }
 
 func TestInstall_ReusesPersistedSet(t *testing.T) {
@@ -1048,6 +1091,33 @@ func TestRunCommandShowsGatewayProgressWhenReconcilingCachedGateway(t *testing.T
 	require.Empty(t, mock.CopyLog)
 }
 
+func TestRunCommandDryRunDoesNotReconcileCachedGateway(t *testing.T) {
+	root, state, _, stdout, stderr := buildUpTestRoot(t)
+	stateDir := config.StateDir(state.Flags.StateDir, state.RepoDir)
+	id := idName("gastown")
+
+	require.NoError(t, state.Driver.Create(testCtx(t), id, driver.CreateOptions{}))
+	require.NoError(t, state.Driver.WriteLabRef(testCtx(t), id, config.LabRef{Lab: "gastown", Orch: "gastown", Driver: "mock"}))
+	markPrepareCompleted(t, stateDir, id)
+	require.NoError(t, phases.Mark(stateDir, id, phases.PhaseGateway))
+
+	ensured := 0
+	orig := ensureLabLiteLLMSidecarForUp
+	ensureLabLiteLLMSidecarForUp = func(_ context.Context, _ *RootState, _ config.LabRef) error {
+		ensured++
+		return nil
+	}
+	t.Cleanup(func() { ensureLabLiteLLMSidecarForUp = orig })
+
+	out, _, err := execUpRoot(t, root, stdout, stderr, "run", "gastown", "--skip-workspace", "--skip-auth-check", "--dry-run")
+	require.NoError(t, err)
+	require.Zero(t, ensured)
+	require.Contains(t, out, "Reconciling LiteLLM sidecar")
+	require.Contains(t, out, "Reloading shared gateway proxy")
+	require.Contains(t, out, "gateway              (ready)")
+	require.Contains(t, out, "No changes were made.")
+}
+
 func TestGatewayCommandMarksPhaseWithoutRefreshingProxyPage(t *testing.T) {
 	root, state, _, stdout, stderr := buildUpTestRoot(t)
 	stateDir := config.StateDir(state.Flags.StateDir, state.RepoDir)
@@ -1355,6 +1425,33 @@ func TestDown_StopsLabLiteLLMSidecar(t *testing.T) {
 	require.Equal(t, "gastown", stopped[0].Lab)
 }
 
+func TestDownDryRunKeepsLabAndSidecarRunning(t *testing.T) {
+	root, state, _, stdout, stderr := buildUpTestRoot(t)
+
+	require.NoError(t, state.Driver.Create(testCtx(t), idName("gastown"), driver.CreateOptions{}))
+	require.NoError(t, state.Driver.WriteLabRef(testCtx(t), idName("gastown"), config.LabRef{
+		Lab:    "gastown",
+		Orch:   "gastown",
+		Driver: "mock",
+	}))
+
+	sidecarRunning := true
+	orig := stopLabLiteLLMSidecarForDown
+	stopLabLiteLLMSidecarForDown = func(_ context.Context, _ *RootState, _ config.LabRef) error {
+		sidecarRunning = false
+		return nil
+	}
+	t.Cleanup(func() { stopLabLiteLLMSidecarForDown = orig })
+
+	_, _, err := execUpRoot(t, root, stdout, stderr, "down", "gastown", "--dry-run")
+	require.NoError(t, err)
+
+	st, err := state.Driver.Status(testCtx(t), idName("gastown"))
+	require.NoError(t, err)
+	require.Equal(t, "running", st.State)
+	require.True(t, sidecarRunning)
+}
+
 func TestLabUp_ResumesStoppedLabWithRecordedDriver(t *testing.T) {
 	root, state, mock, _, _ := buildUpTestRoot(t)
 	ctx := testCtx(t)
@@ -1561,7 +1658,7 @@ func TestEnvReset_ClearsPhases(t *testing.T) {
 	require.NoError(t, state.Driver.WriteLabRef(testCtx(t), id, config.LabRef{Lab: "gastown", Orch: "gastown", Driver: "mock"}))
 	require.NoError(t, phases.Mark(stateDir, id, phases.PhaseBootstrap))
 
-	_, _, err := execUpRoot(t, root, stdout, stderr, "reset", "gastown")
+	_, _, err := execUpRoot(t, root, stdout, stderr, "reset", "--yes", "gastown")
 	require.NoError(t, err)
 
 	// Phase markers should be cleared
@@ -1571,15 +1668,12 @@ func TestEnvReset_ClearsPhases(t *testing.T) {
 // ---- dry-run for taxiway up ----
 
 func TestUp_DryRun(t *testing.T) {
-	root, state, mock, stdout, stderr := buildUpTestRoot(t)
+	root, state, _, stdout, stderr := buildUpTestRoot(t)
 	stateDir := config.StateDir(state.Flags.StateDir, state.RepoDir)
 	id := idName("gastown")
 
 	out, _, err := execUpRoot(t, root, stdout, stderr, "up", "gastown", "--type", "gastown", "--dry-run")
 	require.NoError(t, err)
-
-	// No Exec calls in dry-run
-	require.Empty(t, mock.ExecLog, "dry-run should not execute scripts")
 
 	// No phase markers written
 	for _, p := range phases.Order {
@@ -1591,6 +1685,42 @@ func TestUp_DryRun(t *testing.T) {
 		require.Contains(t, out, string(p), "dry-run output should mention phase %s", p)
 	}
 	require.NotContains(t, out, "doctor", "dry-run output must not mention doctor (not a pipeline phase)")
+	require.Contains(t, out, `Dry-run for lifecycle "up" on lab "gastown"`)
+	require.Equal(t, 1, strings.Count(out, "No changes were made."))
+	require.Contains(t, out, "Creating Mock lab runtime")
+	require.Contains(t, out, "install")
+	require.Contains(t, out, "verify")
+}
+
+func TestPrepareAndRunDryRunExpandSemanticPhasePlans(t *testing.T) {
+	t.Run("prepare", func(t *testing.T) {
+		root, _, _, stdout, stderr := buildUpTestRoot(t)
+
+		out, _, err := execUpRoot(t, root, stdout, stderr, "prepare", "demo", "--type", "gastown", "--dry-run")
+
+		require.NoError(t, err)
+		require.Contains(t, out, "Creating Mock lab runtime")
+		require.Contains(t, out, "ok")
+		require.Contains(t, out, "install")
+		require.Contains(t, out, "verify")
+		require.NotContains(t, out, "Reconciling LiteLLM sidecar")
+		require.Equal(t, 1, strings.Count(out, "No changes were made."))
+	})
+
+	t.Run("run", func(t *testing.T) {
+		root, state, _, stdout, stderr := buildUpTestRoot(t)
+		id := idName("gastown")
+		require.NoError(t, state.Driver.Create(testCtx(t), id, driver.CreateOptions{}))
+		require.NoError(t, state.Driver.WriteLabRef(testCtx(t), id, config.LabRef{Lab: "gastown", Orch: "gastown", Driver: "mock"}))
+
+		out, _, err := execUpRoot(t, root, stdout, stderr, "run", "gastown", "--dry-run")
+
+		require.NoError(t, err)
+		require.Contains(t, out, "Configuring lab gateway environment")
+		require.Contains(t, out, "start")
+		require.NotContains(t, out, "Creating Mock lab runtime")
+		require.Equal(t, 1, strings.Count(out, "No changes were made."))
+	})
 }
 
 // TestUp_NoRuntimeEnvCopyDuringInstallVerify: with --prepare-only, the install
@@ -1983,8 +2113,9 @@ func TestUp_RepoSwitchRefused(t *testing.T) {
 	require.Contains(t, err.Error(), "refusing to switch")
 }
 
-func TestUp_ExistingLabRepoUpdatePreservesDriver(t *testing.T) {
+func TestUp_ExistingLabDryRunLeavesRefUnchanged(t *testing.T) {
 	root, state, _, stdout, stderr := buildWorkspaceTestRoot(t)
+	installFakeDockerForStoppedLab(t)
 	id := idName("claude-code")
 	require.NoError(t, state.Driver.Create(testCtx(t), id, driver.CreateOptions{}))
 	require.NoError(t, state.Driver.WriteLabRef(testCtx(t), id, config.LabRef{
@@ -1993,19 +2124,25 @@ func TestUp_ExistingLabRepoUpdatePreservesDriver(t *testing.T) {
 		Driver: "docker",
 	}))
 
-	_, _, err := execUpRoot(t, root, stdout, stderr,
+	refPath := filepath.Join(state.Flags.StateDir, config.LabDirOf(id), "ref.json")
+	before, err := os.ReadFile(refPath)
+	require.NoError(t, err)
+
+	addOrchestratorProfile(t, state, "claude-code", "budget", map[string]string{
+		"settings/config.json": `{"model":"preview"}`,
+	})
+	_, _, err = execUpRoot(t, root, stdout, stderr,
 		"up", "claude-code", "--type", "claude-code",
 		"--repo", "https://github.com/org/repo1",
+		"--set", "model=preview",
+		"--profile", "budget",
 		"--dry-run",
 	)
 	require.NoError(t, err)
 
-	ref, ok, err := state.Driver.ReadLabRef(testCtx(t), id)
+	after, err := os.ReadFile(refPath)
 	require.NoError(t, err)
-	require.True(t, ok)
-	require.Equal(t, "docker", ref.Driver)
-	require.NotNil(t, ref.Workspace)
-	require.Equal(t, "https://github.com/org/repo1", ref.Workspace.Repo)
+	require.Equal(t, before, after, "dry-run must leave ref.json byte-identical")
 }
 
 // TestUp_InvalidRepoURL: non-git URL is rejected early.
@@ -2056,7 +2193,7 @@ func TestShell_GastownDefaultBranch(t *testing.T) {
 	root, state, mock, stdout, stderr := buildUpTestRoot(t)
 
 	// Write the final gastown manifest.yaml (no shell: block).
-	manifestContent := "name: gastown\ndescription: Gas Town HQ + workspace shell\ndocs_url: https://gastownhall.ai\n"
+	manifestContent := "name: gastown\ndescription: Gas Town HQ + workspace shell\ndocs_url: https://github.com/gastownhall/gastown\n"
 	require.NoError(t, os.WriteFile(
 		filepath.Join(state.RepoDir, "orchestrators", "gastown", "manifest.yaml"),
 		[]byte(manifestContent), 0644,
@@ -2141,7 +2278,68 @@ func TestBuildBaseEnv_CrewName_FailFast(t *testing.T) {
 			Repo: "https://github.com/acme/myrepo",
 		},
 	}
-	_, err := buildBaseEnv(ref)
+	_, err := buildBaseEnv(t.TempDir(), ref)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "injected: cannot resolve username")
+}
+
+func TestVersionChangeFailureInvalidatesCachedInstallForResume(t *testing.T) {
+	root, state, mock, out, errOut := buildUpTestRoot(t)
+	ref := config.LabRef{Lab: "gastown", Orch: "gastown", Driver: "mock", Settings: map[string]string{"claude-code-version": "1.0.0"}}
+	require.NoError(t, mock.Create(context.Background(), idName(ref.Lab), driver.CreateOptions{}))
+	require.NoError(t, mock.WriteLabRef(context.Background(), idName(ref.Lab), ref))
+	for _, phase := range phases.Order {
+		require.NoError(t, phases.Mark(state.Flags.StateDir, idName(ref.Lab), phase))
+	}
+	mock.FailExec["install.sh"] = errors.New("release unavailable")
+	_, _, err := execUpRoot(t, root, out, errOut, "up", ref.Lab, "--set", "claude-code-version=2.0.0", "--prepare-only")
+	require.ErrorContains(t, err, "release unavailable")
+	require.False(t, phases.Done(state.Flags.StateDir, idName(ref.Lab), phases.PhaseInstall))
+	require.True(t, phases.Done(state.Flags.StateDir, idName(ref.Lab), phases.PhaseWorkspace), "workspace must be retained")
+	delete(mock.FailExec, "install.sh")
+	mock.ExecLog = nil
+	_, _, err = execUpRoot(t, root, out, errOut, "up", ref.Lab, "--prepare-only")
+	require.NoError(t, err)
+	require.Contains(t, mock.ExecLog, "install.sh")
+}
+
+func TestVersionChangeUsesPersistedLabDriver(t *testing.T) {
+	_, state, _, _, _ := buildUpTestRoot(t)
+	bin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "docker"), []byte("#!/bin/sh\nexit 0\n"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "limactl"), []byte("#!/bin/sh\nexit 1\n"), 0755))
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	state.Driver = driver.NewLimaDriver(state.Flags.StateDir)
+	ref := config.LabRef{Lab: "pinned", Orch: "codex", Driver: "docker", Settings: map[string]string{"codex-version": "0.159.0"}}
+	require.NoError(t, config.WriteLabRef(state.Flags.StateDir, idName(ref.Lab), ref))
+	_, err := applySettingsFromFlags(context.Background(), state, idName(ref.Lab), &ref, []string{"codex-version=0.160.0"}, nil)
+	require.NoError(t, err)
+	saved, ok, err := config.ReadLabRef(state.Flags.StateDir, idName(ref.Lab))
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "0.160.0", saved.Settings["codex-version"])
+}
+
+func TestLabScriptsReceiveTheDriverGuestKind(t *testing.T) {
+	root, _, mock, stdout, stderr := buildUpTestRoot(t)
+
+	_, _, err := execUpRoot(t, root, stdout, stderr, "up", "mon-lab", "--type", "gastown")
+	require.NoError(t, err)
+
+	scripts := 0
+	for i, env := range mock.ExecEnvLog {
+		if !strings.HasSuffix(mock.ExecLog[i], ".sh") {
+			continue // direct driver commands are not phase scripts
+		}
+		scripts++
+		require.Equal(t, mock.GuestKind(), env["TAXIWAY_GUEST_KIND"], "script %s", mock.ExecLog[i])
+	}
+	require.Positive(t, scripts)
+}
+
+func TestWithGuestKindOverridesCallerValue(t *testing.T) {
+	caller := map[string]string{"TAXIWAY_GUEST_KIND": "vm", "KEEP": "1"}
+	env := withGuestKind(driver.NewMockDriver(t.TempDir()), caller)
+	require.Equal(t, map[string]string{"TAXIWAY_GUEST_KIND": "container", "KEEP": "1"}, env)
+	require.Equal(t, "vm", caller["TAXIWAY_GUEST_KIND"], "caller env is not mutated")
 }

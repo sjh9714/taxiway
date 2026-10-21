@@ -109,7 +109,7 @@ func TestBuildBaseEnv_DoesNotInjectHostHQDirByDefault(t *testing.T) {
 	t.Setenv("TAXIWAY_HQ_DIR", "")
 
 	ref := config.LabRef{Lab: "mylab", Orch: "gastown"}
-	env, err := buildBaseEnv(ref)
+	env, err := buildBaseEnv(t.TempDir(), ref)
 	require.NoError(t, err)
 	require.NotContains(t, env, "TAXIWAY_HQ_DIR",
 		"TAXIWAY_HQ_DIR defaults must be resolved inside the lab, not on the host")
@@ -119,7 +119,7 @@ func TestBuildBaseEnv_HQDirOverride(t *testing.T) {
 	t.Setenv("TAXIWAY_HQ_DIR", "/custom/hq")
 
 	ref := config.LabRef{Lab: "mylab", Orch: "gastown"}
-	env, err := buildBaseEnv(ref)
+	env, err := buildBaseEnv(t.TempDir(), ref)
 	require.NoError(t, err)
 	require.Equal(t, "/custom/hq", env["TAXIWAY_HQ_DIR"])
 }
@@ -156,10 +156,9 @@ func TestGastownInstallUsesSetVersionWithLatestDefault(t *testing.T) {
 	require.Contains(t, script, `install_github_release_binary gastownhall gastown gastown "$GASTOWN_INSTALL_REF" gt`)
 	require.NotContains(t, script, `go install`)
 	require.NotContains(t, script, `GO_VERSION`)
-	require.NotContains(t, script, `go.dev/dl`)
 }
 
-func TestGastownInstallUsesReleaseArchivesOnly(t *testing.T) {
+func TestGastownInstallUsesReleaseArchivesWithPinnedSelfSlingBackport(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join("..", "..", "orchestrators", "gastown", "install.sh"))
 	require.NoError(t, err)
 
@@ -173,6 +172,15 @@ func TestGastownInstallUsesReleaseArchivesOnly(t *testing.T) {
 	require.Contains(t, script, `install -m 0755 "$bin" "$target"`)
 	require.Contains(t, script, `install_github_release_binary gastownhall gastown gastown "$GASTOWN_INSTALL_REF" gt`)
 	require.Contains(t, script, `install_github_release_binary gastownhall beads beads "$BEADS_INSTALL_REF" bd`)
+	require.Contains(t, script, `if [ "$GASTOWN_INSTALL_REF" = "v1.2.1" ]; then`)
+	require.Contains(t, script, `local source_commit="319d33a91b2deca59bba6dd26be6b9daf8eaacf6"`)
+	require.Contains(t, script, `https://github.com/gastownhall/gastown/archive/${source_commit}.tar.gz`)
+	require.Contains(t, script, `https://go.dev/dl/go1.25.8.linux-${arch}.tar.gz`)
+	require.Contains(t, script, `printf '%s  %s\n' "$source_sha" "$builddir/source.tar.gz" | sha256sum --check --status`)
+	require.Contains(t, script, `printf '%s  %s\n' "$go_sha" "$builddir/go.tar.gz" | sha256sum --check --status`)
+	require.Contains(t, script, `/patches/self-sling-4050.patch`)
+	require.Contains(t, script, `CGO_ENABLED=0 GOTOOLCHAIN=local "$builddir/go/bin/go" build -buildvcs=false -trimpath`)
+	require.Contains(t, script, `local build="taxiway-self-sling-4050"`)
 	require.Contains(t, script, `Release archive unavailable for ${owner}/${repo} ${ref}`)
 	require.NotContains(t, script, `falling back to go install`)
 	require.NotContains(t, script, `$HOME/go/bin`)
@@ -239,7 +247,7 @@ func TestGastownManifestDocumentsBeadsVersionSetting(t *testing.T) {
 	require.NoError(t, err)
 
 	manifest := string(content)
-	require.Contains(t, manifest, `Gastown version/tag to install from release archive`)
+	require.Contains(t, manifest, `Gastown release version/tag to install`)
 	require.Contains(t, manifest, `name: beads-version`)
 	require.Contains(t, manifest, `Beads version/tag override`)
 	require.Contains(t, manifest, "phases:\n      - install")
@@ -252,8 +260,8 @@ func TestGastownManifestDocumentsModelSetting(t *testing.T) {
 	manifest := string(content)
 	require.Contains(t, manifest, `name: model`)
 	require.Contains(t, manifest, `Full Claude Code model name passed with --model and resolved by LiteLLM.`)
-	require.Contains(t, manifest, `default: claude-opus-4-8`)
-	require.Contains(t, manifest, "examples:\n      - claude-opus-4-8\n      - claude-sonnet-4-6\n      - claude-haiku-4-5-20251001")
+	require.Contains(t, manifest, `default: claude-opus-5-5`)
+	require.Contains(t, manifest, "examples:\n      - claude-fable-5-1\n      - claude-opus-5-5\n      - claude-sonnet-5-5")
 	require.Contains(t, manifest, "phases:\n      - start")
 }
 
@@ -299,7 +307,7 @@ func TestGastownStartConfiguresLiteLLMClaudeCodeAgent(t *testing.T) {
 
 	script := string(content)
 	require.Contains(t, script, `. "${HOME}/.config/taxiway/env"`)
-	require.Contains(t, script, `GASTOWN_MODEL="${TAXIWAY_SET_MODEL:-claude-opus-4-8}"`)
+	require.Contains(t, script, `GASTOWN_MODEL="${TAXIWAY_SET_MODEL:?Missing model: start this orchestrator through Taxiway}"`)
 	require.Contains(t, script, `TAXIWAY_LITELLM_BASE_URL="${TAXIWAY_LITELLM_BASE_URL:-http://${TAXIWAY_LAB:-lab}.litellm.internal:4000}"`)
 	require.Contains(t, script, `LiteLLM is required for Gas Town`)
 	require.Contains(t, script, `settings/agents.json`)
@@ -449,7 +457,7 @@ func TestCodexStartConfiguresLiteLLMSubscriptionProvider(t *testing.T) {
 	require.NoError(t, err)
 
 	script := string(content)
-	require.Contains(t, script, `CODEX_MODEL="${TAXIWAY_SET_MODEL:-gpt-5.5}"`)
+	require.Contains(t, script, `CODEX_MODEL="${TAXIWAY_SET_MODEL:?Missing model: start this orchestrator through Taxiway}"`)
 	require.Contains(t, script, `model_provider = "taxiway-litellm"`)
 	require.Contains(t, script, `printf 'model_provider = "taxiway-litellm"\n'`)
 	require.Contains(t, script, `printf 'model = "%s"\n' "$CODEX_MODEL"`)
@@ -469,7 +477,7 @@ func TestCodexStartConfiguresLiteLLMSubscriptionProvider(t *testing.T) {
 	require.NotContains(t, script, "langfuse_session_id")
 	require.NotContains(t, script, `TAXIWAY_LITELLM_SESSION_ID`)
 	require.Contains(t, script, `TAXIWAY_LITELLM_AGENT_ID`)
-	require.Contains(t, script, `agent_cmd="codex resume --last || codex"`)
+	require.Contains(t, script, `printf -v agent_cmd 'codex resume --last %q || codex %q'`)
 	require.Contains(t, script, `"$agent_cmd"`)
 	require.Contains(t, script, `TAXIWAY_SET_MODEL`)
 }
@@ -480,14 +488,15 @@ func TestClaudeCodeStartPropagatesLiteLLMEnvironment(t *testing.T) {
 
 	script := string(content)
 	require.Contains(t, script, `. "${HOME}/.config/taxiway/env"`)
-	require.Contains(t, script, `CLAUDE_CODE_MODEL="${TAXIWAY_SET_MODEL:-claude-opus-4-8}"`)
+	require.Contains(t, script, `CLAUDE_CODE_MODEL="${TAXIWAY_SET_MODEL:?Missing model: start this orchestrator through Taxiway}"`)
 	require.Contains(t, script, `TAXIWAY_LITELLM_BASE_URL="${TAXIWAY_LITELLM_BASE_URL:-http://${TAXIWAY_LAB:-lab}.litellm.internal:4000}"`)
 	require.Contains(t, script, `export ANTHROPIC_BASE_URL="${TAXIWAY_LITELLM_BASE_URL%/}"`)
 	require.Contains(t, script, `export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer ${TAXIWAY_LITELLM_API_KEY}"`)
 	require.NotContains(t, script, `ANTHROPIC_MODEL`)
 	require.Contains(t, script, `TAXIWAY_LITELLM_API_KEY`)
 	require.Contains(t, script, `export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}"`)
-	require.Contains(t, script, `agent_cmd="claude --model \"$CLAUDE_CODE_MODEL\""`)
+	// The actual launch command and model arguments are exercised by
+	// tests/scripts/orchestrators/claude-code/test_start.sh.
 	require.Contains(t, script, `"$agent_cmd"`)
 	require.Contains(t, script, `tmux_env_args+=(-e "${name}=${!name}")`)
 }

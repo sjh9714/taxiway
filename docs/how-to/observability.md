@@ -4,7 +4,7 @@ Taxiway's observability stack is the optional Langfuse runtime used to store and
 inspect model traces. It is separate from lab gateways:
 
 - **Observability stack:** Langfuse web, Langfuse worker, Postgres,
-  ClickHouse, Redis, and MinIO.
+  ClickHouse, Redis, and SeaweedFS (S3 object storage).
 - **Gateway path:** the shared Caddy proxy plus one LiteLLM sidecar per lab.
 
 The observability stack does not proxy model traffic. Lab gateways can export
@@ -121,6 +121,14 @@ checkout and the Compose project and proxy container are namespaced per checkout
 
 Langfuse receives traces from LiteLLM. It does not manage provider credentials,
 model routing, or lab gateway keys.
+
+Generation costs come from the lab gateway. LiteLLM prices each call and exports
+the total as `llm.cost.total`, which Langfuse records as the provided cost
+instead of applying its own model price table. A model missing from LiteLLM's
+price map therefore shows a cost of 0, not an unknown cost. ChatGPT
+subscription routes are priced as the equivalent OpenAI API model when LiteLLM's
+price map has one: their cost estimates API usage, not what the subscription
+bills. Otherwise the gateway warns at startup and their cost is 0.
 
 The lab `gateway` phase is responsible for:
 

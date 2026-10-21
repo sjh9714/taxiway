@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -135,7 +136,7 @@ func TestObserveEnsureEnvFile_IdempotentPartial(t *testing.T) {
 	assert.Contains(t, content, "LANGFUSE_INIT_USER_PASSWORD=")
 	assert.Contains(t, content, "LANGFUSE_POSTGRES_PASSWORD=")
 	assert.Contains(t, content, "LANGFUSE_CLICKHOUSE_PASSWORD=")
-	assert.Contains(t, content, "LANGFUSE_MINIO_ROOT_PASSWORD=")
+	assert.Contains(t, content, "LANGFUSE_S3_SECRET_ACCESS_KEY=")
 	assert.Contains(t, content, "LANGFUSE_REDIS_AUTH=")
 	assert.NotContains(t, content, "LANGFUSE_INIT_PROJECT_")
 
@@ -244,6 +245,7 @@ func TestObserveEnsureLiteLLMConfig_GeneratesFromModelCatalog(t *testing.T) {
 	assert.Contains(t, config, "model_name: gpt-5.4")
 	assert.Contains(t, config, "model: chatgpt/gpt-5.4")
 	assert.Contains(t, config, "mode: responses")
+	assert.Contains(t, config, "chatgpt_pricing.proxy_handler_instance")
 	assert.Contains(t, config, "model_name: claude-opus-4-8")
 	assert.Contains(t, config, "model: anthropic/claude-opus-4-8")
 	assert.Contains(t, config, "forward_client_headers_to_llm_api:")
@@ -279,6 +281,7 @@ func TestObserveEnsureLiteLLMConfig_FiltersCodexModelsWhenAuthMissing(t *testing
 	require.NoError(t, err)
 	config := string(data)
 	assert.NotContains(t, config, "model_name: gpt-5.4")
+	assert.NotContains(t, config, "chatgpt_pricing")
 	assert.Contains(t, config, "model_name: claude-opus-4-8")
 }
 
@@ -560,27 +563,6 @@ func TestEnsureProxyRuntimeAllocatesDevPortWithoutPersistingBeforeLaunch(t *test
 	assert.NotEqual(t, 4000, first.Port)
 }
 
-func TestObservabilityRuntimeKeepsLegacyRuntimeStateButDoesNotExposePorts(t *testing.T) {
-	observabilityDir := filepath.Join(t.TempDir(), ".observability")
-	require.NoError(t, os.MkdirAll(observabilityDir, 0o700))
-	require.NoError(t, os.WriteFile(filepath.Join(observabilityDir, "runtime.json"), []byte(`{
-  "worker_port": 32000,
-  "langfuse_port": 32000
-}
-`), 0o600))
-	t.Setenv("TAXIWAY_CONTEXT", "dev")
-	t.Setenv("TAXIWAY_CONTEXT_ID", "a1b2c3d4")
-	t.Setenv("TAXIWAY_OBSERVABILITY_DIR", observabilityDir)
-	state := &RootState{}
-
-	runtime, err := state.ensureObservabilityRuntime()
-
-	require.NoError(t, err)
-	assert.Zero(t, runtime.WorkerPort)
-	assert.Zero(t, runtime.LangfusePort)
-	assert.NotContains(t, runtime.ComposeEnv(proxyRuntime{Port: 45123}), "HOST_PORT")
-}
-
 func TestObservabilityRuntimeRejectsIncompleteDevContext(t *testing.T) {
 	t.Setenv("TAXIWAY_CONTEXT", "dev")
 	t.Setenv("TAXIWAY_CONTEXT_ID", "")
@@ -732,17 +714,17 @@ func TestObserveLiteLLMAssets_OmitsCodexSessionMapperWhenDisabled(t *testing.T) 
 }
 
 func TestObserveLiteLLMAssets_ExposeAgentNativeModelNames(t *testing.T) {
-	repoDir := filepath.Join("..", "..")
+	state := providerModelCatalogState(t)
 
-	config, err := renderLiteLLMConfig(&RootState{RepoDir: repoDir}, true, true, nil)
+	config, err := renderLiteLLMConfig(state, true, true, nil)
 	require.NoError(t, err)
 	configText := string(config)
 
 	for _, modelName := range []string{
-		"model_name: gpt-5.5",
-		"model_name: gpt-5.4",
-		"model_name: gpt-5.4-mini",
-		"model_name: gpt-5.3-codex-spark",
+		"model_name: gpt-6.1-sol",
+		"model_name: gpt-6-astra",
+		"model_name: gpt-6-luna",
+		"model_name: gpt-5.6-sol",
 		"model_name: claude-opus-4-8",
 		"model_name: claude-sonnet-4-6",
 		"model_name: claude-haiku-4-5-20251001",
@@ -1515,6 +1497,73 @@ func TestEnsureLiteLLMChatGPTAuth_ConvertsCodexAuthFile(t *testing.T) {
 	assert.Contains(t, string(data), `"account_id":"account"`)
 }
 
+func TestEnsureLiteLLMChatGPTAuth_ValidatesNewerCache(t *testing.T) {
+	for _, tc := range []struct {
+		name, cached, want string
+	}{
+		{"device-login-only", `{"device_code_requested_at":123}`, "host-access"},
+		{"malformed", `{`, "host-access"},
+		{"refreshed", `{"access_token":"refreshed-access","refresh_token":"refresh","id_token":"id"}`, "refreshed-access"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			source := filepath.Join(home, ".codex", "auth.json")
+			stateDir := filepath.Join(home, "auth")
+			cache := liteLLMChatGPTAuthStatePath(stateDir)
+			require.NoError(t, os.MkdirAll(filepath.Dir(source), 0o700))
+			require.NoError(t, os.MkdirAll(filepath.Dir(cache), 0o700))
+			require.NoError(t, os.WriteFile(source, []byte(`{"tokens":{"access_token":"host-access","refresh_token":"refresh","id_token":"id"}}`), 0o600))
+			require.NoError(t, os.WriteFile(cache, []byte(tc.cached), 0o600))
+			older := time.Now().Add(-time.Hour)
+			require.NoError(t, os.Chtimes(source, older, older))
+			enabled, err := ensureLiteLLMChatGPTAuth(stateDir, true)
+			require.NoError(t, err)
+			require.True(t, enabled)
+			data, err := os.ReadFile(cache)
+			require.NoError(t, err)
+			assert.Contains(t, string(data), tc.want)
+		})
+	}
+}
+
+func TestEnsureLiteLLMChatGPTAuth_RestrictsExistingCacheModes(t *testing.T) {
+	for _, tc := range []struct {
+		name, cached string
+	}{
+		{"valid-cache-kept", `{"access_token":"a","refresh_token":"r","id_token":"i"}`},
+		// WriteFile keeps an existing file's mode, so the rewrite must chmod it.
+		{"invalid-cache-rewritten", `{`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			source := filepath.Join(home, ".codex", "auth.json")
+			stateDir := filepath.Join(home, "auth")
+			cache := liteLLMChatGPTAuthStatePath(stateDir)
+			require.NoError(t, os.MkdirAll(filepath.Dir(source), 0o700))
+			require.NoError(t, os.MkdirAll(filepath.Dir(cache), 0o755))
+			require.NoError(t, os.Chmod(filepath.Dir(cache), 0o755))
+			require.NoError(t, os.WriteFile(source, []byte(`{"tokens":{"access_token":"host-access","refresh_token":"refresh","id_token":"id"}}`), 0o600))
+			require.NoError(t, os.WriteFile(cache, []byte(tc.cached), 0o644))
+			require.NoError(t, os.Chmod(cache, 0o644))
+			older := time.Now().Add(-time.Hour)
+			require.NoError(t, os.Chtimes(source, older, older))
+
+			enabled, err := ensureLiteLLMChatGPTAuth(stateDir, true)
+
+			require.NoError(t, err)
+			require.True(t, enabled)
+			dirInfo, err := os.Stat(filepath.Dir(cache))
+			require.NoError(t, err)
+			assert.Equal(t, os.FileMode(0o700), dirInfo.Mode().Perm())
+			fileInfo, err := os.Stat(cache)
+			require.NoError(t, err)
+			assert.Equal(t, os.FileMode(0o600), fileInfo.Mode().Perm())
+		})
+	}
+}
+
 func TestEnsureLiteLLMConfigFile_OverwritesGeneratedLabConfig(t *testing.T) {
 	tmp := t.TempDir()
 	home := t.TempDir()
@@ -1599,7 +1648,7 @@ func TestObserveDown_DockerMissing(t *testing.T) {
 	assert.Contains(t, strings.ToLower(err.Error()), "docker")
 }
 
-func TestObserveDownStopsStackAndKeepsRuntimePorts(t *testing.T) {
+func TestObserveDownStopsStackAndKeepsRuntimeState(t *testing.T) {
 	tmp := t.TempDir()
 	observabilityDir := filepath.Join(tmp, ".observability")
 	proxyDir := filepath.Join(tmp, ".proxy")
@@ -1618,7 +1667,7 @@ exit 0
 	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "infra", "observability"), 0o755))
 	require.NoError(t, os.MkdirAll(observabilityDir, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(observabilityDir, "runtime.json"), []byte(`{
-  "langfuse_port": 55123
+  "initialized": true
 }
 `), 0o600))
 
@@ -1653,7 +1702,7 @@ func TestObserveDownKeepsProxyRunningWhenNoTargetsRemainRunning(t *testing.T) {
 	require.NoError(t, os.MkdirAll(observabilityDir, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(observabilityDir, ".env"), []byte("LANGFUSE_INIT_USER_PASSWORD=test\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(observabilityDir, "runtime.json"), []byte(`{
-  "langfuse_port": 55123
+  "initialized": true
 }
 `), 0o600))
 	require.NoError(t, os.MkdirAll(proxyDir, 0o700))
@@ -1667,7 +1716,6 @@ func TestObserveDownKeepsProxyRunningWhenNoTargetsRemainRunning(t *testing.T) {
 		ContextID:      "a1b2c3d4",
 		StateDir:       observabilityDir,
 		ComposeProject: "taxiway-dev-a1b2c3d4-observability",
-		LangfusePort:   55123,
 	}))
 	require.NoError(t, err)
 	writeFakeDocker(t, fmt.Sprintf(`#!/bin/sh
@@ -1707,7 +1755,7 @@ exit 0
 	assert.Empty(t, stderr.String())
 }
 
-func TestObserveRmVolumesRemovesComposeVolumesAndRuntimePorts(t *testing.T) {
+func TestObserveRmVolumesRemovesComposeVolumesAndRuntimeState(t *testing.T) {
 	tmp := t.TempDir()
 	observabilityDir := filepath.Join(tmp, ".observability")
 	proxyDir := filepath.Join(tmp, ".proxy")
@@ -1726,7 +1774,7 @@ exit 0
 	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "infra", "observability"), 0o755))
 	require.NoError(t, os.MkdirAll(observabilityDir, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(observabilityDir, "runtime.json"), []byte(`{
-  "langfuse_port": 55123
+  "initialized": true
 }
 `), 0o600))
 
@@ -1760,7 +1808,7 @@ func TestObserveRmKeepsProxyRuntimeWhenNoTargetsRemain(t *testing.T) {
 	require.NoError(t, os.MkdirAll(observabilityDir, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(observabilityDir, ".env"), []byte("LANGFUSE_INIT_USER_PASSWORD=test\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(observabilityDir, "runtime.json"), []byte(`{
-  "langfuse_port": 55123
+  "initialized": true
 }
 `), 0o600))
 	require.NoError(t, os.MkdirAll(proxyDir, 0o700))
@@ -1774,7 +1822,6 @@ func TestObserveRmKeepsProxyRuntimeWhenNoTargetsRemain(t *testing.T) {
 		ContextID:      "a1b2c3d4",
 		StateDir:       observabilityDir,
 		ComposeProject: "taxiway-dev-a1b2c3d4-observability",
-		LangfusePort:   55123,
 	}))
 	require.NoError(t, err)
 	writeFakeDocker(t, fmt.Sprintf(`#!/bin/sh
@@ -2212,7 +2259,7 @@ exit 1
 	require.NoError(t, os.MkdirAll(observabilityDir, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(observabilityDir, ".env"), []byte("LANGFUSE_INIT_USER_PASSWORD=test\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(observabilityDir, "runtime.json"), []byte(`{
-  "langfuse_port": 55123
+  "initialized": true
 }
 `), 0o600))
 
@@ -2225,7 +2272,7 @@ exit 1
 	out := stdout.String()
 	assert.Contains(t, out, "Status: partial")
 	assert.Contains(t, out, "postgres: running")
-	assert.Contains(t, out, "minio: missing")
+	assert.Contains(t, out, "seaweedfs: missing")
 	assert.Empty(t, stderr.String())
 }
 
@@ -2292,7 +2339,11 @@ func TestStatusIgnoresNonCanonicalRuntimeContextLabDirs(t *testing.T) {
 	t.Setenv("TAXIWAY_PROXY_DIR", proxyDir)
 	writeFakeDocker(t, `#!/bin/sh
 if [ "$1" = "version" ]; then exit 0; fi
-if [ "$1" = "inspect" ]; then exit 1; fi
+if [ "$1" = "inspect" ]; then
+  for id do :; done
+  printf 'Error: No such object: %s\n' "$id" >&2
+  exit 1
+fi
 if [ "$1" = "ps" ]; then exit 0; fi
 exit 1
 `)
@@ -2683,7 +2734,7 @@ func TestObservabilityComposeFilesOnlyIncludesLangfuse(t *testing.T) {
 
 func TestObservabilityComposeServicesOnlyIncludesLangfuseStack(t *testing.T) {
 	assert.Equal(t, []string{
-		"minio",
+		"seaweedfs",
 		"postgres",
 		"redis",
 		"clickhouse",

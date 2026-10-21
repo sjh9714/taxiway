@@ -13,6 +13,22 @@ describe('docs loader', () => {
     expect(seen.size).toBe(docs.length);
   });
 
+  it('exposes the release recipe next to publication documentation', () => {
+    const pages = navGroups.find(group => group.name === 'Contributing').pages;
+    const release = pages.findIndex(page => page.rel === 'contributing/release');
+    expect(pages[release + 1].route).toBe('/docs/contributing/release-qualification');
+    expect(resolveDocLink('contributing/release', 'release-qualification.md')).toEqual({
+      kind: 'internal', to: '/docs/contributing/release-qualification',
+    });
+  });
+
+  it('lists the agentic system page after Issues in Contributing', () => {
+    const pages = navGroups.find(group => group.name === 'Contributing').pages;
+    const issues = pages.findIndex(page => page.rel === 'contributing/issues');
+    expect(pages[issues + 1].route).toBe('/docs/contributing/agentic-system');
+    expect(pages[issues + 1].title).toBe('Project agents');
+  });
+
   it('derives a title from the first H1', () => {
     expect(titleFromRaw('Intro\n\n# First title\n\n# Second title', 'Fallback')).toBe('First title');
     expect(titleFromRaw('No heading', 'Fallback')).toBe('Fallback');
@@ -80,6 +96,14 @@ describe('resolveDocLink', () => {
   it('resolves a same-file .md link with an anchor', () => {
     expect(resolveDocLink('contributing/development', 'development.md#commit-messages')).toEqual({
       kind: 'internal', to: '/docs/contributing/development#commit-messages',
+    });
+  });
+
+  it('keeps one fragment for a link to a section of the contributing index', () => {
+    // The index's own headings are not on the site: the link lands on the
+    // overview's Contributing section instead of /docs#contributing#at-a-glance.
+    expect(resolveDocLink('contributing/testing', 'README.md#at-a-glance')).toEqual({
+      kind: 'internal', to: '/docs#contributing',
     });
   });
 

@@ -80,6 +80,7 @@ test('cta and footer show real taxiway content and curated links', () => {
   expect(text).toContain('Claude Code');
   expect(text).toContain('Codex');
   expect(text).toContain('Gas Town');
+  expect(text).toContain('Gas City');
   // Footer: Documentation
   expect(text).toContain('Overview');
   expect(text).toContain('Concepts');
@@ -87,4 +88,8 @@ test('cta and footer show real taxiway content and curated links', () => {
   // Footer: Project
   expect(text).toContain('GitHub');
   expect(text).toContain('License');
+  // Footer: how the project is maintained
+  expect(text).toContain('Taxiway is maintained with AI agents, under human review: see how.');
+  expect(screen.getByRole('link', { name: 'see how' }).getAttribute('href'))
+    .toBe('/docs/contributing/agentic-system');
 });

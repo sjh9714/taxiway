@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -80,7 +81,7 @@ func TestPrepareLabLiteLLMSidecarFilesWritesComposeAndRoute(t *testing.T) {
 	require.NoError(t, yaml.Unmarshal(compose, &composeFile))
 	require.Contains(t, composeFile.Services, "postgres")
 	require.Contains(t, composeFile.Services, "litellm")
-	assert.Equal(t, "litellm/litellm:1.88.1", composeFile.Services["litellm"].Image)
+	assert.Equal(t, "litellm/litellm:1.103.2", composeFile.Services["litellm"].Image)
 	assert.Equal(t, "unless-stopped", composeFile.Services["postgres"].Restart)
 	assert.Empty(t, composeFile.Services["litellm"].Restart)
 	assert.Contains(t, composeText, "LITELLM_MASTER_KEY: sk-litellm-lab")
@@ -93,6 +94,7 @@ func TestPrepareLabLiteLLMSidecarFilesWritesComposeAndRoute(t *testing.T) {
 	assert.Contains(t, composeText, "name: taxiway-gastown-gateway_default")
 	assert.Contains(t, composeText, "host.docker.internal:host-gateway")
 	assert.Contains(t, composeText, liteLLMCodexSessionMapperAssetPath(state))
+	assert.Contains(t, composeText, liteLLMChatGPTPricingAssetPath(state)+":/app/chatgpt_pricing.py:ro")
 	assert.Contains(t, composeText, liteLLMChatGPTTokenStateDir(observabilityDir))
 
 	config, err := os.ReadFile(filepath.Join(labGatewayDir(stateDir, ref), "litellm_config.yaml"))
@@ -197,6 +199,27 @@ exit 1
 
 	require.Error(t, err)
 	assert.Equal(t, "wait for lab LiteLLM sidecar taxiway-e2e-deadbeef-claude-code-up-gateway-litellm-1: exit status 1", err.Error())
+}
+
+func TestWarnLabLiteLLMUnpricedModelsListsModelsWithoutPrice(t *testing.T) {
+	writeFakeDocker(t, `#!/bin/sh
+echo '{"data":[{"model_name":"claude-opus-5","model_info":{"input_cost_per_token":5e-06,"output_cost_per_token":2.5e-05}},{"model_name":"claude-sonnet-5-5","model_info":{"input_cost_per_token":null,"output_cost_per_token":null}},{"model_name":"gpt-6-sol","model_info":{"input_cost_per_token":0,"output_cost_per_token":0}}]}'
+`)
+	var out bytes.Buffer
+
+	warnLabLiteLLMUnpricedModels(context.Background(), &out, "taxiway-e2e-deadbeef-claude-code-up-gateway-litellm-1")
+
+	assert.Equal(t, "  WARN model claude-sonnet-5-5 has no LiteLLM price; its Langfuse cost will be 0\n"+
+		"  WARN model gpt-6-sol has no LiteLLM price; its Langfuse cost will be 0\n", out.String())
+}
+
+func TestWarnLabLiteLLMUnpricedModelsReportsUnreadablePrices(t *testing.T) {
+	writeFakeDocker(t, "#!/bin/sh\nexit 1\n")
+	var out bytes.Buffer
+
+	warnLabLiteLLMUnpricedModels(context.Background(), &out, "taxiway-e2e-deadbeef-claude-code-up-gateway-litellm-1")
+
+	assert.Equal(t, "  WARN could not read LiteLLM model prices: exit status 1\n", out.String())
 }
 
 func TestPrepareLabLiteLLMSidecarFilesEnablesCodexSessionMapperForCodexLabs(t *testing.T) {

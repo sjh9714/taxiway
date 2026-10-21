@@ -130,12 +130,12 @@ func newRecordListCmd(state *RootState) *cobra.Command {
 
 func newRecordRmCmd(state *RootState) *cobra.Command {
 	var force bool
-	var name string
+	var name, recordingID string
 	cmd := &cobra.Command{
-		Use:               "rm <lab> --name <name>",
+		Use:               "rm <lab> (--name <name> | --id <id>)",
 		Aliases:           []string{"remove", "delete"},
 		Short:             "Remove a lab recording",
-		Long:              "Remove a lab recording.\n\nRemoval is explicit: pass --name to select the recording. Use --force to stop an active recording before removing it.",
+		Long:              "Remove a lab recording.\n\nRemoval is explicit: pass --name for a unique name or --id for a specific recording. Use --force to stop an active recording before removing it.",
 		Args:              cobra.RangeArgs(1, 2),
 		ValidArgsFunction: completeActiveLabs(state),
 		PreRunE: func(cmd *cobra.Command, args []string) error {
@@ -151,13 +151,23 @@ func newRecordRmCmd(state *RootState) *cobra.Command {
 				}
 				name = args[1]
 			}
+			if recordingID != "" {
+				if name != "" {
+					return fmt.Errorf("use either --name or --id, not both")
+				}
+				return recording.ValidateName(recordingID)
+			}
 			return recording.ValidateName(name)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if recordingID != "" {
+				return runRecordRmByID(cmd, state, args[0], recordingID, force)
+			}
 			return runRecordRm(cmd, state, args[0], name, force)
 		},
 	}
-	cmd.Flags().StringVar(&name, "name", "", "recording name to remove")
+	cmd.Flags().StringVar(&name, "name", "", "unique recording name to remove")
+	cmd.Flags().StringVar(&recordingID, "id", "", "recording ID to remove")
 	cmd.Flags().BoolVar(&force, "force", false, "stop an active recording before removing it")
 	return cmd
 }
@@ -279,6 +289,10 @@ Supported runners:
 }
 
 func runRecordStart(cmd *cobra.Command, state *RootState, lab, name string) error {
+	return runRecordStartAt(cmd, state, lab, name, time.Now().UTC())
+}
+
+func runRecordStartAt(cmd *cobra.Command, state *RootState, lab, name string, now time.Time) error {
 	ctx := context.Background()
 	driverID := idName(lab)
 	ref, err := loadLabRef(ctx, state, driverID)
@@ -290,7 +304,6 @@ func runRecordStart(cmd *cobra.Command, state *RootState, lab, name string) erro
 		return err
 	}
 
-	now := time.Now().UTC()
 	if name == "" {
 		name = recording.DefaultName(now)
 	}
@@ -317,10 +330,12 @@ func runRecordStart(cmd *cobra.Command, state *RootState, lab, name string) erro
 	if err != nil {
 		return err
 	}
-	if err := startRecordingProcess(ctx, d, driverID, target, recorderSession, castlab); err != nil {
+	if err := checkRecordingDependencies(ctx, d, driverID); err != nil {
 		return err
 	}
-
+	if err := checkRecordingMount(ctx, d, driverID); err != nil {
+		return err
+	}
 	session := recording.Session{
 		ID:              recordingID,
 		Name:            name,
@@ -336,6 +351,11 @@ func runRecordStart(cmd *cobra.Command, state *RootState, lab, name string) erro
 	}
 	idx.Upsert(session)
 	if err := store.Save(idx); err != nil {
+		return err
+	}
+
+	// Save first: interrupted or ambiguous launches remain visible and recoverable.
+	if err := startRecordingProcess(ctx, d, driverID, target, recorderSession, castlab); err != nil {
 		return err
 	}
 
@@ -427,7 +447,8 @@ func runRecordListAll(cmd *cobra.Command, state *RootState) error {
 		store := recording.NewStore(stateDir, entry.Name())
 		idx, err := store.Load()
 		if err != nil {
-			return err
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: recordings for lab %q: %v\n", entry.Name(), err)
+			continue
 		}
 		sessions = append(sessions, idx.Sessions...)
 	}
@@ -445,6 +466,7 @@ func runRecordListAll(cmd *cobra.Command, state *RootState) error {
 }
 
 type recordListRow struct {
+	id      string
 	lab     string
 	name    string
 	state   string
@@ -459,6 +481,7 @@ func recordListRowFromSession(session recording.Session) recordListRow {
 		stopped = session.StoppedAt.UTC().Format("2006-01-02T15:04:05Z")
 	}
 	return recordListRow{
+		id:      session.ID,
 		lab:     session.Lab,
 		name:    session.Name,
 		state:   string(session.State),
@@ -476,18 +499,18 @@ func printRecordListRows(w io.Writer, includeLab bool, rows []recordListRow) {
 
 	if includeLab {
 		labW := maxRecordListLen("LAB", func(row recordListRow) string { return row.lab }, rows)
-		format := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s\n", labW, nameW, stateW, startedW, stoppedW)
-		fmt.Fprintf(w, format, "LAB", "NAME", "STATE", "STARTED", "STOPPED", "CAST")
+		format := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s  %%s\n", labW, nameW, stateW, startedW, stoppedW)
+		fmt.Fprintf(w, format, "LAB", "NAME", "STATE", "STARTED", "STOPPED", "CAST", "ID")
 		for _, row := range rows {
-			fmt.Fprintf(w, format, row.lab, row.name, row.state, row.started, row.stopped, row.cast)
+			fmt.Fprintf(w, format, row.lab, row.name, row.state, row.started, row.stopped, row.cast, row.id)
 		}
 		return
 	}
 
-	format := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s\n", nameW, stateW, startedW, stoppedW)
-	fmt.Fprintf(w, format, "NAME", "STATE", "STARTED", "STOPPED", "CAST")
+	format := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s  %%s\n", nameW, stateW, startedW, stoppedW)
+	fmt.Fprintf(w, format, "NAME", "STATE", "STARTED", "STOPPED", "CAST", "ID")
 	for _, row := range rows {
-		fmt.Fprintf(w, format, row.name, row.state, row.started, row.stopped, row.cast)
+		fmt.Fprintf(w, format, row.name, row.state, row.started, row.stopped, row.cast, row.id)
 	}
 }
 
@@ -502,16 +525,33 @@ func maxRecordListLen(header string, value func(recordListRow) string, rows []re
 }
 
 func runRecordRm(cmd *cobra.Command, state *RootState, lab, name string, force bool) error {
+	return removeRecording(cmd, state, lab, name, "", force)
+}
+func runRecordRmByID(cmd *cobra.Command, state *RootState, lab, recordingID string, force bool) error {
+	return removeRecording(cmd, state, lab, "", recordingID, force)
+}
+func removeRecording(cmd *cobra.Command, state *RootState, lab, name, recordingID string, force bool) error {
 	stateDir := config.StateDir(state.Flags.StateDir, state.RepoDir)
 	store := recording.NewStore(stateDir, lab)
 	idx, err := store.Load()
 	if err != nil {
 		return err
 	}
-	session, ok := idx.RemoveByName(name)
-	if !ok {
-		return fmt.Errorf("recording %q not found for lab %q", name, lab)
+	selected := -1
+	for i, candidate := range idx.Sessions {
+		if (recordingID != "" && candidate.ID == recordingID) || (recordingID == "" && candidate.Name == name) {
+			if selected != -1 {
+				return fmt.Errorf("recording name %q is ambiguous for lab %q; use --id from record list", name, lab)
+			}
+			selected = i
+		}
 	}
+	if selected < 0 {
+		return fmt.Errorf("recording %q not found for lab %q", name+recordingID, lab)
+	}
+	session := idx.Sessions[selected]
+	name = session.Name
+	idx.Sessions = append(idx.Sessions[:selected], idx.Sessions[selected+1:]...)
 	if session.State == recording.StateRecording {
 		if !force {
 			idx.Upsert(session)
@@ -527,19 +567,18 @@ func runRecordRm(cmd *cobra.Command, state *RootState, lab, name string, force b
 			idx.Upsert(session)
 			return err
 		}
-		if err := stopRecordingProcess(context.Background(), d, session.DriverID, session.RecorderSession); err != nil {
+		if err := stopRecordingProcess(context.Background(), d, idName(lab), session.RecorderSession); err != nil {
 			idx.Upsert(session)
 			return err
 		}
 	}
-	if session.CastPathHost != "" {
-		if err := os.Remove(session.CastPathHost); err != nil && !os.IsNotExist(err) {
-			idx.Upsert(session)
-			return fmt.Errorf("remove cast %s: %w", session.CastPathHost, err)
-		}
-	}
 	if err := store.Save(idx); err != nil {
 		return err
+	}
+	if session.CastPathHost != "" {
+		if err := store.RemoveCast(session); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: recording removed from index, but cast %s could not be deleted: %v\n", session.CastPathHost, err)
+		}
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Recording removed: %s\n", session.Name)
 	return nil
@@ -568,14 +607,44 @@ func runRecordAnalyze(cmd *cobra.Command, state *RootState, lab, recordName stri
 		return err
 	}
 	progress.Stepf("Selected %d stopped recording(s).", len(sessions))
+	// Read through the anchored store now. The lab may replace a cast with a
+	// symlink at any time; an external runner must not reopen guest-controlled
+	// host paths after validation.
+	casts := make([]string, 0, len(sessions))
+	analysisDir := store.Dir()
+	if !promptOnly {
+		analysisDir, err = os.MkdirTemp("", "taxiway-record-analysis-")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(analysisDir)
+	}
+	sessions = slices.Clone(sessions)
+	for i, session := range sessions {
+		data, err := store.ReadCast(session)
+		if err != nil {
+			return fmt.Errorf("recording: read analysis cast: %w", err)
+		}
+		if promptOnly {
+			casts = append(casts, string(data))
+		} else {
+			path := filepath.Join(analysisDir, fmt.Sprintf("%d.cast", i))
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				return err
+			}
+			sessions[i].CastPathHost = path
+		}
+	}
 	resolvedLanguage, err := resolveAnalysisLanguage(language, os.Getenv)
 	if err != nil {
 		return err
 	}
 	prompt, err := buildRecordAnalysisPrompt(recordAnalysisPromptOptions{
 		Lab:           lab,
-		RecordingsDir: store.Dir(),
+		RecordingsDir: analysisDir,
 		Sessions:      sessions,
+		Casts:         casts,
+		Inline:        promptOnly,
 		DetailLevel:   detailLevel,
 		Language:      resolvedLanguage,
 	})
@@ -599,6 +668,12 @@ func runRecordAnalyze(cmd *cobra.Command, state *RootState, lab, recordName stri
 	})
 	if err != nil {
 		return err
+	}
+	if runner.Name == "claude-code" {
+		// Private snapshots are outside the project workspace. Grant access only
+		// to that directory, retaining the user's normal permission mode.
+		runner.Args = append(slices.Clone(runner.Args), "--add-dir", analysisDir, "--")
+		runner.InteractiveArgs = append(slices.Clone(runner.InteractiveArgs), "--add-dir", analysisDir, "--")
 	}
 	progress.Stepf("Selected runner: %s.", runner.Name)
 	if interactive {
@@ -721,6 +796,8 @@ type recordAnalysisPromptOptions struct {
 	Lab           string
 	RecordingsDir string
 	Sessions      []recording.Session
+	Casts         []string
+	Inline        bool
 	DetailLevel   string
 	Language      string
 }
@@ -739,6 +816,7 @@ type recordAnalysisPromptData struct {
 	Sessions      []recordAnalysisPromptSession
 	FullDetail    bool
 	Language      string
+	Inline        bool
 }
 
 type recordAnalysisPromptSession struct {
@@ -749,6 +827,7 @@ type recordAnalysisPromptSession struct {
 	StartedAt    string
 	StoppedAt    string
 	ShellCommand string
+	CastData     string
 }
 
 func renderRecordAnalysisPrompt(opts recordAnalysisPromptOptions) (string, error) {
@@ -757,11 +836,16 @@ func renderRecordAnalysisPrompt(opts recordAnalysisPromptOptions) (string, error
 		RecordingsDir: opts.RecordingsDir,
 		FullDetail:    opts.DetailLevel == analysisDetailFull,
 		Language:      opts.Language,
+		Inline:        opts.Inline,
 	}
-	for _, session := range opts.Sessions {
+	for i, session := range opts.Sessions {
 		stopped := "-"
 		if session.StoppedAt != nil {
 			stopped = session.StoppedAt.UTC().Format(time.RFC3339)
+		}
+		castData := ""
+		if i < len(opts.Casts) {
+			castData = opts.Casts[i]
 		}
 		data.Sessions = append(data.Sessions, recordAnalysisPromptSession{
 			Name:         session.Name,
@@ -771,6 +855,7 @@ func renderRecordAnalysisPrompt(opts recordAnalysisPromptOptions) (string, error
 			StartedAt:    session.StartedAt.UTC().Format(time.RFC3339),
 			StoppedAt:    stopped,
 			ShellCommand: session.ShellCommand,
+			CastData:     castData,
 		})
 	}
 	tmpl, err := template.ParseFS(recordPromptTemplates, "prompts/record_analysis.md.tmpl")
@@ -1244,7 +1329,12 @@ func runRecordPlayer(cmd *cobra.Command, state *RootState, lab string, port int,
 		}
 	}
 
-	server := &http.Server{Handler: http.FileServer(http.Dir(store.Dir()))}
+	root, err := store.OpenRoot(false)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	server := &http.Server{Handler: http.FileServer(http.FS(recording.PlayerFiles(root)))}
 	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("recording player: serve: %w", err)
 	}
@@ -1339,16 +1429,11 @@ func openBrowserURL(url string) error {
 }
 
 func startRecordingProcess(ctx context.Context, d driver.Driver, id string, target shellTarget, recorderSession, castPath string) error {
-	if err := checkRecordingDependencies(ctx, d, id); err != nil {
-		return err
-	}
-	if err := checkRecordingMount(ctx, d, id); err != nil {
-		return err
-	}
 	attachCommand := target.AttachCommand
 	if target.RequiresTmux && target.SessionName != "" {
 		attachCommand = "tmux attach-session -f read-only,ignore-size -t " + target.SessionName
 	}
+	attachCommand = "tmux set-option -t " + shellQuote(recorderSession) + " @taxiway-recorder-client \"$(tty)\" && exec " + attachCommand
 	resizeTargetCmd := ""
 	if target.RequiresTmux && target.SessionName != "" {
 		resizeTargetCmd = fmt.Sprintf(
@@ -1393,17 +1478,71 @@ func checkRecordingMount(ctx context.Context, d driver.Driver, id string) error 
 }
 
 func stopRecordingProcess(ctx context.Context, d driver.Driver, id, recorderSession string) error {
-	stopCmd := "tmux send-keys -t " + shellQuote(recorderSession) + " C-b d"
-	res, err := d.Exec(ctx, id, driver.ExecRequest{
-		Argv: []string{"/bin/sh", "-c", stopCmd},
-	})
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	running, err := d.Running(ctx, id)
 	if err != nil {
-		return fmt.Errorf("record stop failed: %w", err)
+		return fmt.Errorf("check recording lab: %w", err)
 	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("record stop failed: exit code %d", res.ExitCode)
+	if !running {
+		return nil
 	}
-	return nil
+	deadline := time.Now().Add(5 * time.Second)
+	detached := false
+	for {
+		present, err := recorderSessionPresent(ctx, d, id, recorderSession)
+		if err != nil {
+			return err
+		}
+		if !present {
+			return nil
+		}
+		if !detached {
+			var client bytes.Buffer
+			res, err := d.Exec(ctx, id, driver.ExecRequest{Argv: []string{"tmux", "show-option", "-qv", "-t", recorderSession, "@taxiway-recorder-client"}, Stdout: &client})
+			if err != nil {
+				return fmt.Errorf("find recorder client: %w", err)
+			}
+			if res.ExitCode != 0 {
+				return fmt.Errorf("find recorder client failed: exit code %d", res.ExitCode)
+			}
+			tty := strings.TrimSpace(client.String())
+			if tty != "" {
+				res, err = d.Exec(ctx, id, driver.ExecRequest{Argv: []string{"tmux", "detach-client", "-t", tty}})
+				if err != nil {
+					return fmt.Errorf("record stop failed: %w", err)
+				}
+				if res.ExitCode != 0 {
+					return fmt.Errorf("record stop failed: exit code %d", res.ExitCode)
+				}
+				detached = true
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("recorder session %q did not end; recording remains active", recorderSession)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func recorderSessionPresent(ctx context.Context, d driver.Driver, id, recorderSession string) (bool, error) {
+	var stderr bytes.Buffer
+	probe, err := d.Exec(ctx, id, driver.ExecRequest{Argv: []string{"tmux", "has-session", "-t", "=" + recorderSession}, Env: map[string]string{"LC_ALL": "C"}, Stderr: &stderr})
+	if err != nil {
+		return false, fmt.Errorf("check recorder session: %w", err)
+	}
+	if probe.ExitCode == 0 {
+		return true, nil
+	}
+	message := strings.TrimSpace(stderr.String())
+	if probe.ExitCode == 1 && (strings.HasPrefix(message, "can't find session:") || strings.HasPrefix(message, "no server running on ") || (strings.HasPrefix(message, "error connecting to ") && strings.HasSuffix(message, "(No such file or directory)"))) {
+		return false, nil
+	}
+	return false, fmt.Errorf("check recorder session failed: exit code %d", probe.ExitCode)
 }
 
 func checkRecordingDependencies(ctx context.Context, d driver.Driver, id string) error {

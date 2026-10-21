@@ -19,6 +19,9 @@ var ErrExecTimeout = errors.New("exec timeout")
 // All CLI commands call only methods on Driver, never tool-specific CLIs directly.
 type Driver interface {
 	Name() string
+	// GuestKind is the environment type the lab provides to phase scripts
+	// (GuestKindContainer or GuestKindVM).
+	GuestKind() string
 
 	// Lifecycle
 	Exists(ctx context.Context, id string) (bool, error)
@@ -64,6 +67,9 @@ type ExecRequest struct {
 	Workdir string
 	Argv    []string
 	Env     map[string]string
+	// Inspect marks an explicitly read-only execution. Dry-run drivers forward
+	// inspection requests while continuing to suppress normal executions.
+	Inspect bool
 	Stdout  io.Writer  // if nil, discarded
 	Stderr  io.Writer  // if nil, discarded
 	Events  event.Sink // optional; receives parsed LAB_AGENT_EVENT lines
@@ -91,3 +97,12 @@ type Status struct {
 	Created time.Time
 	Extra   map[string]string // driver-specific metadata (e.g. session_id, ip)
 }
+
+// Guest kinds name the environment type a driver provides. Phase scripts
+// receive it as TAXIWAY_GUEST_KIND and use each tool's official method for that
+// type, for example a detached supervisor in a container and a service unit in
+// a VM.
+const (
+	GuestKindContainer = "container"
+	GuestKindVM        = "vm"
+)

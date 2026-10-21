@@ -44,6 +44,39 @@ class TrustExecTests(unittest.TestCase):
         return subprocess.run(["bash", LAUNCHER, str(self.hq), *args], cwd=cwd or self.workspace,
                               env=env or self.env, capture_output=True, text=True)
 
+    def test_handoff_enforces_bypass_for_claude_without_profile_arguments(self):
+        binary = self.base / "claude"
+        binary.write_text('#!/usr/bin/env python3\nimport json, sys; print(json.dumps(sys.argv[1:]))\n')
+        binary.chmod(0o755)
+        result = self.run_hook([str(binary), "--resume", "session-id"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ["--dangerously-skip-permissions", "--settings", '{"skipDangerousModePermissionPrompt":true}', "--resume", "session-id"])
+
+    def test_handoff_reloads_settings_and_clears_stale_environment(self):
+        settings = self.user_home / ".config/taxiway/agents/claude-code.env"
+        settings.parent.mkdir(parents=True)
+        self.env.update(ENABLE_TOOL_SEARCH="false", ENABLE_CLAUDEAI_MCP_SERVERS="true")
+        program = 'import os; print(os.environ.get("ENABLE_TOOL_SEARCH")); print(os.environ.get("ENABLE_CLAUDEAI_MCP_SERVERS", "unset"))'
+        for content, expected in [
+            ("export ENABLE_TOOL_SEARCH=true\nexport ENABLE_CLAUDEAI_MCP_SERVERS=false\n", "true\nfalse\n"),
+            ("export ENABLE_TOOL_SEARCH=auto:5\nexport ENABLE_CLAUDEAI_MCP_SERVERS=true\n", "auto:5\ntrue\n"),
+        ]:
+            settings.write_text(content)
+            result = self.run_hook([sys.executable, "-c", program])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected)
+
+    def test_handoff_reloads_native_gateway_auth_mode(self):
+        settings = self.user_home / ".config/taxiway/agents/claude-code.env"
+        settings.parent.mkdir(parents=True)
+        self.env["ANTHROPIC_AUTH_TOKEN"] = "stale-gateway-key"
+        program = 'import os; print(os.environ.get("ANTHROPIC_AUTH_TOKEN", "unset"))'
+        for mode, expected in [("api-key", "test-only-key"), ("subscription", "unset")]:
+            settings.write_text("export TAXIWAY_CLAUDE_AUTH_MODE=" + mode + "\n")
+            result = self.run_hook([sys.executable, "-c", program])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected + "\n")
+
     def test_exec_trusts_actual_cwd_and_preserves_args_env_pid_and_exit(self):
         link = self.base / "workspace-link"
         link.symlink_to(self.workspace, target_is_directory=True)
