@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -59,9 +60,99 @@ var ReferenceURLs = map[string]string{
 	"deprecations": "https://platform.claude.com/docs/en/about-claude/model-deprecations",
 }
 
-var chatRetirement = regexp.MustCompile(`(?s)On ([A-Z][a-z]+ [0-9]{1,2}, [0-9]{4}), ((?i:GPT)-[A-Za-z0-9. -]+?) will retire from ChatGPT, ChatGPT Work, and Codex`)
+// chatRetirementTemplates are the known ChatGPT subscription retirement
+// notices. A parsed section's heading must be exactly "<model> retirement" and
+// its whole body, normalised, exactly one of them: the notice sentence and its
+// OpenAI API exclusion sentence. Only the effective form may then carry the
+// guidance known for that model. A qualifier, a second announcement, a list or
+// any other text makes the notice unknown and needs manual review. Both retire
+// the model from Codex signed in with ChatGPT, which is the `chatgpt` route,
+// and explicitly leave the OpenAI API out of scope.
+var chatRetirementTemplates = []*regexp.Regexp{
+	regexp.MustCompile(`^On (?P<date>[A-Z][a-z]+ [0-9]{1,2}, [0-9]{4}), (?P<model>(?i:GPT)-[A-Za-z0-9. -]+?) will retire from ChatGPT, ChatGPT Work, and Codex\. This retirement does not apply to the OpenAI API\.$`),
+	regexp.MustCompile(`^Effective (?P<date>[A-Z][a-z]+ [0-9]{1,2}, [0-9]{4})(?:, at (?P<clock>noon|(?:1[0-2]|[1-9])(?::[0-5][0-9])? ?[AaPp]M) (?P<zone>P[DS]?T|E[DS]?T|C[DS]?T|M[DS]?T|UTC|GMT)(?: \((?P<utc>(?:[01]?[0-9]|2[0-3]):[0-5][0-9]) UTC\))?)?, (?P<model>(?i:GPT)-[A-Za-z0-9. -]+?) retires from Codex for users signed in with ChatGPT\. The OpenAI API and Codex sessions authenticated with an API key (?:aren't|aren\x{2019}t|are not) affected\.(?: (?P<guidance>.+))?$`),
+}
 
-var chatRetirementAnnouncement = regexp.MustCompile(`(?i)\b(?:will retire|will be retired|retires? from)\b`)
+// chatRetirementGuidance is the exact replacement guidance, normalised, that
+// the ChatGPT models page publishes after a model's notice, up to the next
+// heading. Any other text after a notice, or a change to it, needs review.
+var chatRetirementGuidance = map[string]string{
+	"gpt-5.5": "For Codex with ChatGPT sign-in, choose an available replacement: " +
+		"- On Plus, Pro, Business, Enterprise, and Edu plans, choose **GPT-6.1 Sol** (`gpt-6.1-sol`) when available. " +
+		"- On Free and Go plans, choose **GPT-6 Luna** (`gpt-6-luna`) in the desktop app when available. " +
+		"Replace `gpt-5.5` in workspace defaults, saved model settings, managed configurations, custom agents, scheduled tasks, and scripts that select a model. " +
+		"See [workspace model availability](https://learn.chatgpt.com/docs/enterprise/workspace-model-availability#prepare-for-the-gpt-55-retirement) for administrator guidance. " +
+		`<ContentModeSwitch group="codex-surface" id="app">`,
+}
+
+// Hours behind UTC for each zone a notice may name.
+var chatZoneOffsets = map[string][]int{
+	"UTC": {0}, "GMT": {0},
+	"EDT": {4}, "EST": {5}, "ET": {4, 5},
+	"CDT": {5}, "CST": {6}, "CT": {5, 6},
+	"MDT": {6}, "MST": {7}, "MT": {6, 7},
+	"PDT": {7}, "PST": {8}, "PT": {7, 8},
+}
+
+// chatSameUTCDay fails when a notice's time of day is not the recorded date in
+// UTC, or when its UTC conversion disagrees with its zone.
+func chatSameUTCDay(clock, zone, utc string) error {
+	hour, minute := 0, 0
+	switch c := strings.ToUpper(strings.ReplaceAll(clock, " ", "")); c {
+	case "NOON":
+		hour = 12
+	default:
+		if _, err := fmt.Sscanf(strings.TrimRight(c, "APM"), "%d:%d", &hour, &minute); err != nil {
+			minute = 0
+			if _, err = fmt.Sscanf(strings.TrimRight(c, "APM"), "%d", &hour); err != nil {
+				return fmt.Errorf("chatgpt: ambiguous retirement time %q", clock)
+			}
+		}
+		hour %= 12
+		if strings.HasSuffix(c, "PM") {
+			hour += 12
+		}
+	}
+	offsets := chatZoneOffsets[zone]
+	if utc != "" {
+		var utcHour, utcMinute int
+		if _, err := fmt.Sscanf(utc, "%d:%d", &utcHour, &utcMinute); err != nil {
+			return fmt.Errorf("chatgpt: ambiguous retirement time %q", utc)
+		}
+		offset := (utcHour - hour + 24) % 24
+		if utcMinute != minute || !slices.Contains(offsets, offset) {
+			return fmt.Errorf("chatgpt: retirement time %s %s does not match %s UTC", clock, zone, utc)
+		}
+		offsets = []int{offset}
+	}
+	for _, offset := range offsets {
+		if hour+offset >= 24 {
+			return fmt.Errorf("chatgpt: retirement time %s %s falls on another UTC date", clock, zone)
+		}
+	}
+	return nil
+}
+
+// A section whose heading or body names both "effective" and a retirement is
+// a notice to parse, whatever its heading, so a near-miss notice fails closed
+// instead of being skipped.
+var chatEffective = regexp.MustCompile(`(?i)\beffective\b`)
+var chatRetire = regexp.MustCompile(`(?i)\bretir`)
+
+// chatNormalise maps CRLF line endings, no-break spaces (U+00A0) and
+// non-breaking hyphens (U+2011), and drops zero-width characters (U+200B,
+// U+200C, U+200D, U+2060, U+FEFF) before parsing.
+var chatNormalise = strings.NewReplacer(
+	"\r\n", "\n",
+	string(rune(0x00a0)), " ",
+	string(rune(0x2011)), "-",
+	string(rune(0x200b)), "",
+	string(rune(0x200c)), "",
+	string(rune(0x200d)), "",
+	string(rune(0x2060)), "",
+	string(rune(0xfeff)), "",
+)
+var whitespace = regexp.MustCompile(`\s+`)
 var chatVersionID = regexp.MustCompile(`^gpt-[0-9.]+$`)
 
 func clean(s string) string { return strings.Trim(strings.TrimSpace(s), "`") }
@@ -259,31 +350,62 @@ func Discover(s Sources) (Discovery, error) {
 	}
 	// Check each Markdown section independently: one understood announcement
 	// must never hide another or lend it an API-scope disclaimer.
-	sections := regexp.MustCompile(`(?m)^#{1,6} `).Split(string(s.ChatGPT), -1)
-	for _, section := range sections {
-		// Historical summaries and links are not primary announcements.
-		// A retirement heading or future announcement always requires parsing.
-		heading, _, _ := strings.Cut(section, "\n")
-		if !strings.Contains(strings.ToLower(heading), "retirement") && !strings.Contains(strings.ToLower(section), "will retire") && !strings.Contains(strings.ToLower(section), "will be retired") {
+	sections := regexp.MustCompile(`(?m)^#{1,6} `).Split(chatNormalise.Replace(string(s.ChatGPT)), -1)
+	for i, section := range sections {
+		// Text before the first heading has no heading of its own.
+		heading, body := "", section
+		if i > 0 {
+			heading, body, _ = strings.Cut(section, "\n")
+		}
+		// Markdown wraps sentences at arbitrary points.
+		heading = strings.TrimSpace(whitespace.ReplaceAllString(heading, " "))
+		text := strings.TrimSpace(whitespace.ReplaceAllString(body, " "))
+		// Historical summaries and links are not primary announcements. A
+		// retirement heading, a future announcement or an effective retirement
+		// always requires parsing.
+		effective := (chatEffective.MatchString(heading) && chatRetire.MatchString(heading)) || (chatEffective.MatchString(text) && chatRetire.MatchString(text))
+		lower := strings.ToLower(heading + " " + text)
+		if !effective && !strings.Contains(strings.ToLower(heading), "retirement") && !strings.Contains(lower, "will retire") && !strings.Contains(lower, "will be retired") {
 			continue
 		}
-		matches := chatRetirement.FindAllStringSubmatch(section, -1)
-		if len(matches) != 1 || len(chatRetirementAnnouncement.FindAllString(section, -1)) != 1 {
+		var match []string
+		var template *regexp.Regexp
+		for _, t := range chatRetirementTemplates {
+			if m := t.FindStringSubmatch(text); m != nil {
+				match, template = m, t
+			}
+		}
+		if template == nil {
 			return d, fmt.Errorf("chatgpt: unrecognized retirement notice; manual source review required")
 		}
-		if !strings.Contains(section, "retirement does not apply to the OpenAI API") {
-			return d, fmt.Errorf("ChatGPT retirement API scope unclear")
+		group := func(name string) string {
+			if i := template.SubexpIndex(name); i >= 0 {
+				return match[i]
+			}
+			return ""
 		}
-		match := matches[0]
-		dt, e := date(match[1])
+		model := group("model")
+		// A qualified heading ("postponed", "tentative") can void its body.
+		if !strings.EqualFold(heading, model+" retirement") {
+			return d, fmt.Errorf("chatgpt: unrecognized retirement notice; manual source review required")
+		}
+		id := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(model)), " ", "-")
+		if guidance := group("guidance"); guidance != "" && guidance != chatRetirementGuidance[id] {
+			return d, fmt.Errorf("chatgpt: unrecognized retirement notice; manual source review required")
+		}
+		dt, e := date(group("date"))
 		if e != nil {
 			return d, e
 		}
-		id := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(match[2])), " ", "-")
+		if clock := group("clock"); clock != "" {
+			if e = chatSameUTCDay(clock, group("zone"), group("utc")); e != nil {
+				return d, e
+			}
+		}
 		// Plain historical version IDs are unambiguous. Suffix names must resolve
 		// to an exact public Codex slug; no fuzzy family matching.
 		if !chatVersionID.MatchString(id) && !seen[id] {
-			return d, fmt.Errorf("chatgpt: ambiguous retirement model %q", match[2])
+			return d, fmt.Errorf("chatgpt: ambiguous retirement model %q", model)
 		}
 		if old, ok := d.Retirements[id]; ok && old.Date != dt {
 			return d, fmt.Errorf("conflicting retirement dates for %s", id)
