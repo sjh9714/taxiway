@@ -135,7 +135,7 @@ The shared tooling reuses authentication after the initial user login:
 | Agent | Initial authentication | Reuse by tests |
 |---|---|---|
 | Claude Code | User logs in once inside a reference lab such as `test-claude` | `temporary_lab(..., auth_lab=...)` copies OAuth credentials before starting roles; the `auth` command handles persistent targets |
-| Gas Town | Uses the same Claude Code reference login | Same copy helper; each Gas Town lab keeps its own gateway configuration |
+| Gas Town, Gas City | Use the same Claude Code reference login | Same copy helper; each lab keeps its own gateway configuration |
 | Codex | User has an existing Codex subscription login on the host | Taxiway prepares the lab gateway's ChatGPT authentication cache; no login is copied into the lab client |
 
 Pass the actual Claude reference name with `--auth-lab` (or `--source` for
@@ -154,6 +154,7 @@ Use these feature-independent names within each dev worktree:
 | `test-claude` | `claude-code` | Manual Claude checks and reusable reference authentication |
 | `test-codex` | `codex` | Manual Codex checks using host authentication through the gateway |
 | `test-gastown` | `gastown` | Manual Gas Town checks using a copy of the reference Claude login |
+| `test-gascity` | `gascity` | Manual Gas City checks using a copy of the reference Claude login |
 
 The runtime context isolates these names between worktrees. Existing labs may
 have older names: pass their actual names to the scripts and keep using them;
@@ -169,20 +170,30 @@ direnv exec . ./taxiway up test-gastown --driver docker --type gastown \
   --repo https://github.com/octocat/Hello-World --prepare-only --skip-auth-check
 direnv exec . python3 tests/live/taxiway_live.py auth --source test-claude --target test-gastown
 direnv exec . ./taxiway run test-gastown
+direnv exec . ./taxiway up test-gascity --driver docker --type gascity \
+  --repo https://github.com/octocat/Hello-World --prepare-only --skip-auth-check
+direnv exec . python3 tests/live/taxiway_live.py auth --source test-claude --target test-gascity
+direnv exec . ./taxiway run test-gascity
 ```
 
-Prepare Gas Town before copying authentication so its roles first start with
-a usable login. If a lab already exists, inspect and reuse it instead of
-creating a replacement or overwriting its authentication automatically.
+With the default `gastown` template, an idle Gas City lab keeps calling the
+model: pause it between checks as
+[Pause the City](../orchestrators/gascity.md#pause-the-city) says.
+
+Prepare Gas Town and Gas City before copying authentication so their agents
+first start with a usable login. If a lab already exists, inspect and reuse it
+instead of creating a replacement or overwriting its authentication
+automatically.
 
 Leave persistent labs available after automated checks for the user's manual
 validation. Connect with `direnv exec . ./taxiway shell <lab>`; in Gas Town,
-use `gt status` and `gt mayor attach`. Remove persistent labs only when their
+use `gt status` and `gt mayor attach`; in Gas City, `gc status` and
+`gc session attach gastown.mayor`. Remove persistent labs only when their
 validation work is finished and removal is requested.
 
 Automatically owned scenarios continue to use unique `live-test-<random>`
-names and clean up their own labs. A temporary scenario never removes one of
-the three persistent labs.
+names and clean up their own labs. A temporary scenario never removes a
+persistent lab.
 
 ## Scripts for developers and agents
 

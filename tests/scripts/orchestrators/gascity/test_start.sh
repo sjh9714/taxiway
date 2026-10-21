@@ -132,6 +132,15 @@ printf 'pkill %s\n' "$*" >> "$GC_LOG"
 exit 1
 EOF
   chmod +x "$fake_bin/pkill"
+
+  # The guest has coreutils' timeout; hosts such as macOS do not. The fakes
+  # return at once, so the stand-in runs the command without a bound.
+  cat > "$fake_bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+shift
+exec "$@"
+EOF
+  chmod +x "$fake_bin/timeout"
 }
 
 tmp="$(mktemp -d)"
@@ -186,6 +195,7 @@ claude = data["providers"]["claude"]
 assert claude["args"] == ["--model", "test-selected-claude-model"]
 assert claude["env"]["ENABLE_TOOL_SEARCH"] == "true"
 assert claude["env"]["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
+assert claude["env"]["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] == "1"
 assert claude["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "test-opus"
 config = tomllib.loads((city / "city.toml").read_text())
 assert config["include"] == ["taxiway.toml"]
